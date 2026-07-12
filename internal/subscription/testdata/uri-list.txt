@@ -1,0 +1,6 @@
+vless://550e8400-e29b-41d4-a716-446655440000@vless.example.com:443?encryption=none&security=reality&sni=front.example.com&fp=chrome&pbk=public-key&sid=abcd&type=ws&path=%2Fws&host=cdn.example.com&alpn=h2%2Chttp%2F1.1#VLESS%20Reality
+vmess://eyJ2IjoiMiIsInBzIjoiVk1lc3MgV1MiLCJhZGQiOiJ2bWVzcy5leGFtcGxlLmNvbSIsInBvcnQiOiI0NDMiLCJpZCI6IjU1MGU4NDAwLWUyOWItNDFkNC1hNzE2LTQ0NjY1NTQ0MDAwMCIsImFpZCI6IjAiLCJzY3kiOiJhdXRvIiwibmV0Ijoid3MiLCJ0eXBlIjoibm9uZSIsImhvc3QiOiJjZG4uZXhhbXBsZS5jb20iLCJwYXRoIjoiL3ZtZXNzIiwidGxzIjoidGxzIiwic25pIjoiZnJvbnQuZXhhbXBsZS5jb20iLCJhbHBuIjoiaDIsaHR0cC8xLjEifQ==
+trojan://trojan-secret@trojan.example.com:443?security=tls&sni=trojan-sni.example.com&type=grpc&serviceName=trojan.Service&alpn=h2#Trojan%20gRPC
+ss://YWVzLTI1Ni1nY206c3Mtc2VjcmV0@ss.example.com:8388#Shadowsocks%20Node
+hysteria2://hy-secret@hy2.example.com:8443?sni=hy-sni.example.com&insecure=1&alpn=h3&obfs=salamander&obfs-password=obfs-secret&upmbps=100&downmbps=200#Hysteria%202
+tuic://550e8400-e29b-41d4-a716-446655440000:tuic-secret@tuic.example.com:443?sni=tuic-sni.example.com&alpn=h3&congestion_control=bbr&udp_relay_mode=quic&zero_rtt=1#TUIC%20Node

@@ -1,0 +1,72 @@
+mixed-port: 7890
+proxies:
+  - name: VLESS Clash
+    type: vless
+    server: clash-vless.example.com
+    port: 443
+    uuid: 550e8400-e29b-41d4-a716-446655440000
+    tls: true
+    servername: reality.example.com
+    flow: xtls-rprx-vision
+    network: tcp
+    packet-encoding: xudp
+    reality-opts:
+      public-key: ignored-public-key
+      short-id: ignored-short-id
+  - name: VMess Clash
+    type: vmess
+    server: clash-vmess.example.com
+    port: 443
+    uuid: 550e8400-e29b-41d4-a716-446655440000
+    alterId: 0
+    cipher: aes-128-gcm
+    tls: true
+    servername: vmess-sni.example.com
+    network: grpc
+    grpc-opts:
+      grpc-service-name: clash.Service
+  - name: Trojan Clash
+    type: trojan
+    server: clash-trojan.example.com
+    port: 443
+    password: clash-trojan-secret
+    sni: trojan-sni.example.com
+    skip-cert-verify: true
+    network: httpupgrade
+    http-upgrade-opts:
+      path: /upgrade
+      headers:
+        Host: upgrade.example.com
+  - name: Shadowsocks Clash
+    type: ss
+    server: clash-ss.example.com
+    port: 8388
+    cipher: chacha20-ietf-poly1305
+    password: clash-ss-secret
+    plugin: unsupported-and-ignored
+  - name: Hysteria2 Clash
+    type: hysteria2
+    server: clash-hy2.example.com
+    port: 8443
+    password: clash-hy2-secret
+    sni: hy2-sni.example.com
+    alpn: [h3]
+    obfs: salamander
+    obfs-password: clash-obfs-secret
+    up: 100 Mbps
+    down: 200 Mbps
+  - name: TUIC Clash
+    type: tuic
+    server: clash-tuic.example.com
+    port: 443
+    uuid: 550e8400-e29b-41d4-a716-446655440000
+    password: clash-tuic-secret
+    sni: tuic-sni.example.com
+    alpn: [h3]
+    congestion-controller: bbr
+    udp-relay-mode: quic
+    reduce-rtt: true
+proxy-groups:
+  - name: ignored-provider-group
+    type: select
+    proxies: [VLESS Clash]

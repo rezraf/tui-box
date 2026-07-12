@@ -1,0 +1,2 @@
+vless://550e8400-e29b-41d4-a716-446655440000@dedup.example.com:443?security=tls&type=tcp#First%20Name
+vless://550e8400-e29b-41d4-a716-446655440000@dedup.example.com:443?type=tcp&security=tls#Second%20Name

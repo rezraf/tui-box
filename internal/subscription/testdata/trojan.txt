@@ -1,0 +1,1 @@
+trojan://trojan-secret@trojan.example.com:443?security=tls&sni=trojan-sni.example.com&type=grpc&serviceName=trojan.Service&alpn=h2#Trojan%20gRPC

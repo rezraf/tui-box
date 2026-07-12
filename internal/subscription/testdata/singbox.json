@@ -1,0 +1,74 @@
+{
+  "log": {"level": "debug"},
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "VLESS sing-box",
+      "server": "sing-vless.example.com",
+      "server_port": 443,
+      "uuid": "550e8400-e29b-41d4-a716-446655440000",
+      "packet_encoding": "xudp",
+      "tls": {
+        "enabled": true,
+        "server_name": "reality.example.com",
+        "alpn": ["h2", "http/1.1"],
+        "reality": {"enabled": true, "public_key": "ignored", "short_id": "ignored"}
+      },
+      "transport": {"type": "httpupgrade", "path": "/upgrade", "host": "upgrade.example.com"}
+    },
+    {
+      "type": "vmess",
+      "tag": "VMess sing-box",
+      "server": "sing-vmess.example.com",
+      "server_port": 443,
+      "uuid": "550e8400-e29b-41d4-a716-446655440000",
+      "security": "chacha20-poly1305",
+      "alter_id": 0,
+      "tls": {"enabled": true, "server_name": "vmess-sni.example.com"},
+      "transport": {"type": "grpc", "service_name": "sing.Service"}
+    },
+    {
+      "type": "trojan",
+      "tag": "Trojan sing-box",
+      "server": "sing-trojan.example.com",
+      "server_port": 443,
+      "password": "sing-trojan-secret",
+      "tls": {"enabled": true, "server_name": "trojan-sni.example.com", "insecure": true},
+      "transport": {"type": "ws", "path": "/trojan", "headers": {"Host": "cdn.example.com", "X-Secret": "ignored"}}
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "Shadowsocks sing-box",
+      "server": "sing-ss.example.com",
+      "server_port": 8388,
+      "method": "aes-256-gcm",
+      "password": "sing-ss-secret",
+      "plugin": "ignored"
+    },
+    {
+      "type": "hysteria2",
+      "tag": "Hysteria2 sing-box",
+      "server": "sing-hy2.example.com",
+      "server_port": 8443,
+      "password": "sing-hy2-secret",
+      "tls": {"enabled": true, "server_name": "hy2-sni.example.com", "alpn": ["h3"]},
+      "obfs": {"type": "salamander", "password": "sing-obfs-secret"},
+      "up_mbps": 100,
+      "down_mbps": 200
+    },
+    {
+      "type": "tuic",
+      "tag": "TUIC sing-box",
+      "server": "sing-tuic.example.com",
+      "server_port": 443,
+      "uuid": "550e8400-e29b-41d4-a716-446655440000",
+      "password": "sing-tuic-secret",
+      "tls": {"enabled": true, "server_name": "tuic-sni.example.com", "alpn": ["h3"]},
+      "congestion_control": "bbr",
+      "udp_relay_mode": "quic",
+      "zero_rtt_handshake": true
+    },
+    {"type": "direct", "tag": "ignored direct"}
+  ],
+  "route": {"final": "ignored direct"}
+}
