@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -476,6 +477,147 @@ func TestEndpointValidateRejectsInvalidProtocolOptions(t *testing.T) {
 				t.Fatal("Validate() returned nil, want an error")
 			}
 		})
+	}
+}
+
+func TestEndpointValidateRejectsInvalidUTF8(t *testing.T) {
+	t.Parallel()
+
+	invalidUTF8 := string([]byte{0xff})
+	tests := []struct {
+		name     string
+		protocol Protocol
+		mutate   func(*Endpoint)
+	}{
+		{name: "ID", protocol: ProtocolVLESS, mutate: func(endpoint *Endpoint) { endpoint.ID = invalidUTF8 }},
+		{name: "subscription ID", protocol: ProtocolVLESS, mutate: func(endpoint *Endpoint) { endpoint.SubscriptionID = invalidUTF8 }},
+		{name: "name", protocol: ProtocolVLESS, mutate: func(endpoint *Endpoint) { endpoint.Name = invalidUTF8 }},
+		{name: "host", protocol: ProtocolVLESS, mutate: func(endpoint *Endpoint) { endpoint.Host = invalidUTF8 }},
+		{name: "UUID", protocol: ProtocolVLESS, mutate: func(endpoint *Endpoint) { endpoint.UUID = invalidUTF8 }},
+		{name: "password", protocol: ProtocolTrojan, mutate: func(endpoint *Endpoint) { endpoint.Password = invalidUTF8 }},
+		{name: "method", protocol: ProtocolShadowsocks, mutate: func(endpoint *Endpoint) { endpoint.Method = invalidUTF8 }},
+		{name: "TLS server name", protocol: ProtocolVLESS, mutate: func(endpoint *Endpoint) {
+			endpoint.TLS = TLSOptions{Enabled: true, ServerName: invalidUTF8}
+		}},
+		{name: "TLS ALPN", protocol: ProtocolVLESS, mutate: func(endpoint *Endpoint) {
+			endpoint.TLS = TLSOptions{Enabled: true, ALPN: []string{invalidUTF8}}
+		}},
+		{name: "transport path", protocol: ProtocolVLESS, mutate: func(endpoint *Endpoint) {
+			endpoint.Transport = TransportOptions{Type: TransportWebSocket, Path: invalidUTF8}
+		}},
+		{name: "transport host", protocol: ProtocolVLESS, mutate: func(endpoint *Endpoint) {
+			endpoint.Transport = TransportOptions{Type: TransportWebSocket, Host: invalidUTF8}
+		}},
+		{name: "transport service name", protocol: ProtocolVLESS, mutate: func(endpoint *Endpoint) {
+			endpoint.Transport = TransportOptions{Type: TransportGRPC, ServiceName: invalidUTF8}
+		}},
+		{name: "VLESS flow", protocol: ProtocolVLESS, mutate: func(endpoint *Endpoint) {
+			endpoint.VLESSOptions = &VLESSOptions{Flow: VLESSFlow(invalidUTF8)}
+		}},
+		{name: "VLESS packet encoding", protocol: ProtocolVLESS, mutate: func(endpoint *Endpoint) {
+			endpoint.VLESSOptions = &VLESSOptions{PacketEncoding: PacketEncoding(invalidUTF8)}
+		}},
+		{name: "VMess security", protocol: ProtocolVMess, mutate: func(endpoint *Endpoint) {
+			endpoint.VMessOptions = &VMessOptions{Security: VMessSecurity(invalidUTF8)}
+		}},
+		{name: "VMess packet encoding", protocol: ProtocolVMess, mutate: func(endpoint *Endpoint) {
+			endpoint.VMessOptions = &VMessOptions{PacketEncoding: PacketEncoding(invalidUTF8)}
+		}},
+		{name: "Hysteria2 obfuscation type", protocol: ProtocolHysteria2, mutate: func(endpoint *Endpoint) {
+			endpoint.Hysteria2Options = &Hysteria2Options{ObfsType: Hysteria2ObfsType(invalidUTF8)}
+		}},
+		{name: "Hysteria2 obfuscation password", protocol: ProtocolHysteria2, mutate: func(endpoint *Endpoint) {
+			endpoint.Hysteria2Options = &Hysteria2Options{
+				ObfsType:     Hysteria2ObfsSalamander,
+				ObfsPassword: invalidUTF8,
+			}
+		}},
+		{name: "TUIC congestion control", protocol: ProtocolTUIC, mutate: func(endpoint *Endpoint) {
+			endpoint.TUICOptions = &TUICOptions{CongestionControl: TUICCongestionControl(invalidUTF8)}
+		}},
+		{name: "TUIC UDP relay mode", protocol: ProtocolTUIC, mutate: func(endpoint *Endpoint) {
+			endpoint.TUICOptions = &TUICOptions{UDPRelayMode: TUICUDPRelayMode(invalidUTF8)}
+		}},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			endpoint := validEndpointFor(test.protocol)
+			test.mutate(&endpoint)
+
+			err := endpoint.Validate()
+			if err == nil {
+				t.Fatal("Validate() returned nil, want an error")
+			}
+			if want := "valid UTF-8"; !strings.Contains(err.Error(), want) {
+				t.Fatalf("Validate() error = %q, want it to contain %q", err, want)
+			}
+		})
+	}
+}
+
+func TestEndpointValidateRejectsStringsThatCannotRoundTripThroughJSON(t *testing.T) {
+	t.Parallel()
+
+	endpoint := validEndpoint()
+	endpoint.Name = "invalid-" + string([]byte{0xff})
+
+	if err := endpoint.Validate(); err == nil {
+		t.Fatal("Validate() returned nil, want an error")
+	}
+
+	encoded, err := json.Marshal(endpoint)
+	if err != nil {
+		t.Fatalf("json.Marshal() returned an unexpected error: %v", err)
+	}
+	var roundTripped Endpoint
+	if err := json.Unmarshal(encoded, &roundTripped); err != nil {
+		t.Fatalf("json.Unmarshal() returned an unexpected error: %v", err)
+	}
+	if roundTripped.Name == endpoint.Name {
+		t.Fatal("invalid UTF-8 unexpectedly survived a JSON round trip")
+	}
+}
+
+func TestEndpointValidateRejectsWhitespaceOnlyIdentityFields(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		mutate func(*Endpoint)
+	}{
+		{name: "ID", mutate: func(endpoint *Endpoint) { endpoint.ID = "   " }},
+		{name: "subscription ID", mutate: func(endpoint *Endpoint) { endpoint.SubscriptionID = "   " }},
+		{name: "name", mutate: func(endpoint *Endpoint) { endpoint.Name = "   " }},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			endpoint := validEndpoint()
+			test.mutate(&endpoint)
+
+			if err := endpoint.Validate(); err == nil {
+				t.Fatal("Validate() returned nil, want an error")
+			}
+		})
+	}
+}
+
+func TestEndpointValidatePreservesCredentialWhitespace(t *testing.T) {
+	t.Parallel()
+
+	endpoint := validEndpointFor(ProtocolTrojan)
+	endpoint.Password = "   "
+
+	if err := endpoint.Validate(); err != nil {
+		t.Fatalf("Validate() returned an unexpected error: %v", err)
+	}
+	if endpoint.Password != "   " {
+		t.Fatalf("Password = %q, want credential whitespace unchanged", endpoint.Password)
 	}
 }
 

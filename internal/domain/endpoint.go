@@ -5,6 +5,7 @@ import (
 	"net"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 const (
@@ -101,18 +102,21 @@ func (endpoint Endpoint) validateStrings() error {
 		name     string
 		value    string
 		maxBytes int
-		required bool
+		nonBlank bool
 	}{
-		{name: "ID", value: endpoint.ID, maxBytes: MaxIDLength, required: true},
-		{name: "subscription ID", value: endpoint.SubscriptionID, maxBytes: MaxIDLength, required: true},
-		{name: "name", value: endpoint.Name, maxBytes: MaxNameLength, required: true},
+		{name: "ID", value: endpoint.ID, maxBytes: MaxIDLength, nonBlank: true},
+		{name: "subscription ID", value: endpoint.SubscriptionID, maxBytes: MaxIDLength, nonBlank: true},
+		{name: "name", value: endpoint.Name, maxBytes: MaxNameLength, nonBlank: true},
 		{name: "UUID", value: endpoint.UUID, maxBytes: MaxUUIDLength},
 		{name: "password", value: endpoint.Password, maxBytes: MaxCredentialLength},
 		{name: "method", value: endpoint.Method, maxBytes: MaxMethodLength},
 	}
 	for _, field := range fields {
-		if err := validateString(field.name, field.value, field.maxBytes, field.required); err != nil {
+		if err := validateString(field.name, field.value, field.maxBytes, field.nonBlank); err != nil {
 			return err
+		}
+		if field.nonBlank && strings.TrimSpace(field.value) == "" {
+			return fmt.Errorf("%s is required", field.name)
 		}
 	}
 	return nil
@@ -373,6 +377,9 @@ func rejectStreamTransport(options TransportOptions) error {
 func validateString(name, value string, maxBytes int, required bool) error {
 	if required && value == "" {
 		return fmt.Errorf("%s is required", name)
+	}
+	if !utf8.ValidString(value) {
+		return fmt.Errorf("%s is not valid UTF-8", name)
 	}
 	if len(value) > maxBytes {
 		return fmt.Errorf("%s exceeds %d bytes", name, maxBytes)
