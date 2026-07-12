@@ -76,7 +76,10 @@ func parseVLESS(entry string) (domain.Endpoint, error) {
 	if _, hasPassword := parsed.User.Password(); hasPassword {
 		return domain.Endpoint{}, errInvalidEntry
 	}
-	query := parsed.Query()
+	query, err := url.ParseQuery(parsed.RawQuery)
+	if err != nil {
+		return domain.Endpoint{}, errInvalidEntry
+	}
 	if err := validateVLESSQuery(query); err != nil {
 		return domain.Endpoint{}, errInvalidEntry
 	}
@@ -163,7 +166,14 @@ func parseVMess(entry string) (domain.Endpoint, error) {
 	if serverName == "" {
 		serverName = link.AlternateSNI
 	}
-	tlsEnabled := link.TLS == "tls" || link.TLS == "reality"
+	tlsEnabled := false
+	switch link.TLS {
+	case "", "none":
+	case "tls":
+		tlsEnabled = true
+	default:
+		return domain.Endpoint{}, errInvalidEntry
+	}
 	return domain.Endpoint{
 		Name:     link.Name,
 		Protocol: domain.ProtocolVMess,

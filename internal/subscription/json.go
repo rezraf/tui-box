@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"strings"
+	"unicode"
 )
 
 const maxJSONNestingDepth = 100
@@ -46,10 +48,11 @@ func validateJSONValue(decoder *json.Decoder, depth int) error {
 			if !ok {
 				return errInvalidEntry
 			}
-			if _, duplicate := keys[key]; duplicate {
+			foldedKey := foldJSONKey(key)
+			if _, duplicate := keys[foldedKey]; duplicate {
 				return errInvalidEntry
 			}
-			keys[key] = struct{}{}
+			keys[foldedKey] = struct{}{}
 			if err := validateJSONValue(decoder, depth+1); err != nil {
 				return err
 			}
@@ -64,6 +67,30 @@ func validateJSONValue(decoder *json.Decoder, depth int) error {
 		return requireJSONDelimiter(decoder, ']')
 	default:
 		return errInvalidEntry
+	}
+}
+
+func foldJSONKey(key string) string {
+	var folded strings.Builder
+	folded.Grow(len(key))
+	for _, character := range key {
+		if 'a' <= character && character <= 'z' {
+			character -= 'a' - 'A'
+		} else if character > unicode.MaxASCII {
+			character = foldJSONRune(character)
+		}
+		folded.WriteRune(character)
+	}
+	return folded.String()
+}
+
+func foldJSONRune(character rune) rune {
+	for {
+		folded := unicode.SimpleFold(character)
+		if folded <= character {
+			return folded
+		}
+		character = folded
 	}
 }
 

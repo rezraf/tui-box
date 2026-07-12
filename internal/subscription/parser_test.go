@@ -438,6 +438,23 @@ func TestParseVMessRejectsDuplicateJSONKeys(t *testing.T) {
 	}
 }
 
+func TestValidateStrictJSONRejectsCaseInsensitiveKeyCollisionsAtAnyDepth(t *testing.T) {
+	t.Parallel()
+
+	for _, document := range []string{
+		`{"tls":"none","TLS":"tls"}`,
+		`{"metadata":{"nested":{"value":1,"VALUE":2}}}`,
+	} {
+		document := document
+		t.Run(document, func(t *testing.T) {
+			t.Parallel()
+			if err := validateStrictJSON([]byte(document)); err == nil {
+				t.Fatal("validateStrictJSON() returned nil error, want case-insensitive key collision rejection")
+			}
+		})
+	}
+}
+
 func TestParseVMessRequiresJSONEOF(t *testing.T) {
 	t.Parallel()
 
@@ -457,6 +474,67 @@ func TestParseVMessRequiresJSONEOF(t *testing.T) {
 	}
 	if len(result.Endpoints) != 0 {
 		t.Fatalf("len(Endpoints) = %d, want none", len(result.Endpoints))
+	}
+}
+
+func TestParseVMessAcceptsDocumentedTLSValues(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		value   string
+		enabled bool
+	}{
+		{value: ""},
+		{value: "none"},
+		{value: "tls", enabled: true},
+	} {
+		test := test
+		t.Run(fmt.Sprintf("%q", test.value), func(t *testing.T) {
+			t.Parallel()
+			decoded := fmt.Sprintf(`{
+				"ps":"VMess",
+				"add":"vmess.example.com",
+				"port":"443",
+				"id":"550e8400-e29b-41d4-a716-446655440000",
+				"aid":"0",
+				"scy":"auto",
+				"net":"tcp",
+				"tls":%q
+			}`, test.value)
+			payload := base64.StdEncoding.EncodeToString([]byte(decoded))
+			endpoint, err := parseVMess("vmess://" + payload)
+			if err != nil {
+				t.Fatalf("parseVMess() returned an unexpected error: %v", err)
+			}
+			if endpoint.TLS.Enabled != test.enabled {
+				t.Fatalf("TLS.Enabled = %t, want %t", endpoint.TLS.Enabled, test.enabled)
+			}
+		})
+	}
+}
+
+func TestParseVMessRejectsUnknownTLSValues(t *testing.T) {
+	t.Parallel()
+
+	for _, tlsValue := range []string{"reality", "TRUE", "invalid"} {
+		tlsValue := tlsValue
+		t.Run(tlsValue, func(t *testing.T) {
+			t.Parallel()
+			decoded := fmt.Sprintf(`{
+				"ps":"VMess",
+				"add":"vmess.example.com",
+				"port":"443",
+				"id":"550e8400-e29b-41d4-a716-446655440000",
+				"aid":"0",
+				"scy":"auto",
+				"net":"tcp",
+				"tls":%q
+			}`, tlsValue)
+			payload := base64.StdEncoding.EncodeToString([]byte(decoded))
+			if _, err := parseVMess("vmess://" + payload); err == nil {
+				t.Fatal("parseVMess() returned nil error, want unknown TLS value rejection")
+			}
+		})
 	}
 }
 
@@ -591,6 +669,14 @@ func TestParseRejectsRealityWithoutPublicKey(t *testing.T) {
 	}
 	if len(result.Endpoints) != 0 {
 		t.Fatalf("len(Endpoints) = %d, want none", len(result.Endpoints))
+	}
+}
+
+func TestParseVLESSRejectsMalformedQueryPercentEncoding(t *testing.T) {
+	t.Parallel()
+
+	if _, err := parseVLESS(testVLESSLink("security=tls&sni=%zz")); err == nil {
+		t.Fatal("parseVLESS() returned nil error, want malformed query percent encoding rejection")
 	}
 }
 
