@@ -1,0 +1,22 @@
+# TuiBox v0.1 TODO
+
+- [ ] Bootstrap Go module and validated domain model
+  - Verify: `go test ./internal/domain && go vet ./internal/domain`
+- [ ] Parse six protocols from URI/Base64, Clash YAML, and sing-box JSON
+  - Verify: `go test ./internal/subscription`
+- [ ] Add bounded HTTPS fetching, hybrid secret storage, and atomic state
+  - Verify: `go test ./internal/subscription ./internal/secrets ./internal/state`
+- [ ] Generate typed sing-box configs for both connection modes and three route modes
+  - Verify: `go test ./internal/core`
+- [ ] Add peer-authenticated Unix RPC and daemon lifecycle
+  - Verify: `go test ./internal/rpc ./internal/daemon`
+- [ ] Add refresh, latency, redaction, telemetry consent, and CLI services
+  - Verify: `go test ./internal/app ./internal/latency ./internal/redact ./internal/telemetry ./internal/cli`
+- [ ] Add functional Bubble Tea server selector
+  - Verify: `go test ./internal/tui`
+- [ ] Add installer, updater, system services, and release workflows
+  - Verify: `sh -n install.sh uninstall.sh && go test ./internal/update`
+- [ ] Add English OSS documentation and governance files
+  - Verify: `go run ./cmd/tuibox --help && git grep -n 'TODO\|CHANGEME\|YOUR_' -- ':!go.sum'` returns no unintended placeholders
+- [ ] Complete adversarial security review and full verification
+  - Verify: `go test -race ./... && go vet ./... && go build ./cmd/tuibox ./cmd/tuiboxd && ./scripts/cross-build.sh && git diff --check`
