@@ -121,7 +121,7 @@ type vmessLink struct {
 	Network        string          `json:"net"`
 	TransportHost  string          `json:"host"`
 	Path           string          `json:"path"`
-	TLS            string          `json:"tls"`
+	TLS            json.RawMessage `json:"tls"`
 	ServerName     string          `json:"sni"`
 	AlternateSNI   string          `json:"servername"`
 	ALPN           string          `json:"alpn"`
@@ -166,8 +166,16 @@ func parseVMess(entry string) (domain.Endpoint, error) {
 	if serverName == "" {
 		serverName = link.AlternateSNI
 	}
+	tlsMode := ""
+	if len(link.TLS) > 0 {
+		var value *string
+		if err := json.Unmarshal(link.TLS, &value); err != nil || value == nil {
+			return domain.Endpoint{}, errInvalidEntry
+		}
+		tlsMode = *value
+	}
 	tlsEnabled := false
-	switch link.TLS {
+	switch tlsMode {
 	case "", "none":
 	case "tls":
 		tlsEnabled = true

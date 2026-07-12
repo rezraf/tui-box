@@ -481,15 +481,17 @@ func TestParseVMessAcceptsDocumentedTLSValues(t *testing.T) {
 	t.Parallel()
 
 	for _, test := range []struct {
-		value   string
-		enabled bool
+		name     string
+		tlsField string
+		enabled  bool
 	}{
-		{value: ""},
-		{value: "none"},
-		{value: "tls", enabled: true},
+		{name: "absent"},
+		{name: "empty string", tlsField: `,"tls":""`},
+		{name: "none", tlsField: `,"tls":"none"`},
+		{name: "tls", tlsField: `,"tls":"tls"`, enabled: true},
 	} {
 		test := test
-		t.Run(fmt.Sprintf("%q", test.value), func(t *testing.T) {
+		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 			decoded := fmt.Sprintf(`{
 				"ps":"VMess",
@@ -498,9 +500,8 @@ func TestParseVMessAcceptsDocumentedTLSValues(t *testing.T) {
 				"id":"550e8400-e29b-41d4-a716-446655440000",
 				"aid":"0",
 				"scy":"auto",
-				"net":"tcp",
-				"tls":%q
-			}`, test.value)
+				"net":"tcp"%s
+			}`, test.tlsField)
 			payload := base64.StdEncoding.EncodeToString([]byte(decoded))
 			endpoint, err := parseVMess("vmess://" + payload)
 			if err != nil {
@@ -510,6 +511,25 @@ func TestParseVMessAcceptsDocumentedTLSValues(t *testing.T) {
 				t.Fatalf("TLS.Enabled = %t, want %t", endpoint.TLS.Enabled, test.enabled)
 			}
 		})
+	}
+}
+
+func TestParseVMessRejectsNullTLS(t *testing.T) {
+	t.Parallel()
+
+	decoded := `{
+		"ps":"VMess",
+		"add":"vmess.example.com",
+		"port":"443",
+		"id":"550e8400-e29b-41d4-a716-446655440000",
+		"aid":"0",
+		"scy":"auto",
+		"net":"tcp",
+		"tls":null
+	}`
+	payload := base64.StdEncoding.EncodeToString([]byte(decoded))
+	if _, err := parseVMess("vmess://" + payload); err == nil {
+		t.Fatal("parseVMess() returned nil error, want null TLS rejection")
 	}
 }
 
