@@ -130,7 +130,10 @@ func (endpoint Endpoint) validateProtocolCombination() error {
 		if err := rejectCredential("method", endpoint.Method); err != nil {
 			return err
 		}
-		return endpoint.Transport.validate()
+		if err := endpoint.Transport.validate(); err != nil {
+			return err
+		}
+		return endpoint.validateVLESSFlowCombination()
 	case ProtocolTrojan:
 		if err := rejectCredential("UUID", endpoint.UUID); err != nil {
 			return err
@@ -190,6 +193,19 @@ func (endpoint Endpoint) validateProtocolCombination() error {
 	default:
 		return nil
 	}
+}
+
+func (endpoint Endpoint) validateVLESSFlowCombination() error {
+	if endpoint.Protocol != ProtocolVLESS || endpoint.VLESSOptions == nil || endpoint.VLESSOptions.Flow != VLESSFlowXTLSRPRXVision {
+		return nil
+	}
+	if !endpoint.TLS.Enabled {
+		return fmt.Errorf("VLESS xtls-rprx-vision flow requires TLS")
+	}
+	if endpoint.Transport.Type != TransportTCP {
+		return fmt.Errorf("VLESS xtls-rprx-vision flow requires TCP transport")
+	}
+	return nil
 }
 
 func (protocol Protocol) isSupported() bool {

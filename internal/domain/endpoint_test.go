@@ -39,6 +39,8 @@ func TestEndpointValidateAcceptsProtocolSpecificOptions(t *testing.T) {
 		configure func(*Endpoint)
 	}{
 		{name: "vless", protocol: ProtocolVLESS, configure: func(endpoint *Endpoint) {
+			endpoint.TLS.Enabled = true
+			endpoint.Transport = TransportOptions{Type: TransportTCP}
 			endpoint.VLESSOptions = &VLESSOptions{
 				Flow:           VLESSFlowXTLSRPRXVision,
 				PacketEncoding: PacketEncodingXUDP,
@@ -77,6 +79,53 @@ func TestEndpointValidateAcceptsProtocolSpecificOptions(t *testing.T) {
 
 			if err := endpoint.Validate(); err != nil {
 				t.Fatalf("Validate() returned an unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestEndpointValidateRejectsVLESSVisionWithoutTLS(t *testing.T) {
+	t.Parallel()
+
+	endpoint := validEndpointFor(ProtocolVLESS)
+	endpoint.VLESSOptions = &VLESSOptions{Flow: VLESSFlowXTLSRPRXVision}
+
+	err := endpoint.Validate()
+	if err == nil {
+		t.Fatal("Validate() returned nil, want an error")
+	}
+	if want := "xtls-rprx-vision flow requires TLS"; !strings.Contains(err.Error(), want) {
+		t.Fatalf("Validate() error = %q, want it to contain %q", err, want)
+	}
+}
+
+func TestEndpointValidateRejectsVLESSVisionWithNonTCPTransport(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		transport TransportOptions
+	}{
+		{name: "websocket", transport: TransportOptions{Type: TransportWebSocket, Path: "/proxy"}},
+		{name: "grpc", transport: TransportOptions{Type: TransportGRPC, ServiceName: "proxy.Service"}},
+		{name: "http upgrade", transport: TransportOptions{Type: TransportHTTPUpgrade, Path: "/upgrade"}},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			endpoint := validEndpointFor(ProtocolVLESS)
+			endpoint.TLS.Enabled = true
+			endpoint.Transport = test.transport
+			endpoint.VLESSOptions = &VLESSOptions{Flow: VLESSFlowXTLSRPRXVision}
+
+			err := endpoint.Validate()
+			if err == nil {
+				t.Fatal("Validate() returned nil, want an error")
+			}
+			if want := "xtls-rprx-vision flow requires TCP transport"; !strings.Contains(err.Error(), want) {
+				t.Fatalf("Validate() error = %q, want it to contain %q", err, want)
 			}
 		})
 	}
