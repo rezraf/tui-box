@@ -1,6 +1,6 @@
 # TuiBox v0.1 TODO
 
-- [ ] Bootstrap Go module and validated domain model
+- [x] Bootstrap Go module and validated domain model
   - Verify: `go test ./internal/domain && go vet ./internal/domain`
 - [ ] Parse six protocols from URI/Base64, Clash YAML, and sing-box JSON
   - Verify: `go test ./internal/subscription`
