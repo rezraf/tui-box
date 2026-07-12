@@ -12,7 +12,10 @@ import (
 	"github.com/rezraf/tui-box/internal/domain"
 )
 
-const testSubscriptionID = "subscription-1"
+const (
+	testSubscriptionID   = "subscription-1"
+	testRealityPublicKey = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
+)
 
 func TestParseIndividualShareLinks(t *testing.T) {
 	t.Parallel()
@@ -30,6 +33,7 @@ func TestParseIndividualShareLinks(t *testing.T) {
 			host: "vless.example.com", display: "VLESS Reality",
 			check: func(t *testing.T, endpoint domain.Endpoint) {
 				assertTLS(t, endpoint, "front.example.com", false, []string{"h2", "http/1.1"})
+				assertRealityTLS(t, endpoint, testRealityPublicKey, "abcd", domain.UTLSFingerprintChrome)
 				if endpoint.Transport != (domain.TransportOptions{Type: domain.TransportWebSocket, Path: "/ws", Host: "cdn.example.com"}) {
 					t.Fatalf("Transport = %#v, want websocket fields", endpoint.Transport)
 				}
@@ -139,6 +143,81 @@ func TestParseURIListCoversAllSupportedProtocols(t *testing.T) {
 	}
 }
 
+func TestParseDetectsStructuredDocumentsBeforeEmbeddedRemoteURLs(t *testing.T) {
+	t.Parallel()
+
+	documents := []struct {
+		name     string
+		body     string
+		format   domain.SubscriptionFormat
+		protocol domain.Protocol
+	}{
+		{
+			name: "sing-box JSON",
+			body: `{
+				"remote_subscription": "https://subscriptions.example.com/private",
+				"outbounds": [{
+					"type": "shadowsocks",
+					"tag": "Structured JSON",
+					"server": "json.example.com",
+					"server_port": 8388,
+					"method": "aes-256-gcm",
+					"password": "json-secret"
+				}]
+			}`,
+			format:   domain.SubscriptionFormatSingBox,
+			protocol: domain.ProtocolShadowsocks,
+		},
+		{
+			name: "Clash YAML",
+			body: `proxy-providers:
+  remote:
+    type: http
+    url: https://subscriptions.example.com/private
+proxies:
+  - name: Structured YAML
+    type: ss
+    server: yaml.example.com
+    port: 8388
+    cipher: aes-256-gcm
+    password: yaml-secret
+`,
+			format:   domain.SubscriptionFormatClash,
+			protocol: domain.ProtocolShadowsocks,
+		},
+	}
+
+	for _, document := range documents {
+		document := document
+		t.Run(document.name, func(t *testing.T) {
+			t.Parallel()
+			for _, encoded := range []bool{false, true} {
+				name := "plain"
+				body := []byte(document.body)
+				wantFormat := document.format
+				if encoded {
+					name = "Base64"
+					body = []byte(base64.StdEncoding.EncodeToString(body))
+					wantFormat = domain.SubscriptionFormatBase64
+				}
+				t.Run(name, func(t *testing.T) {
+					t.Parallel()
+					result, err := Parse(testSubscriptionID, body)
+					if err != nil {
+						t.Fatalf("Parse() returned an unexpected error: %v", err)
+					}
+					if result.Format != wantFormat {
+						t.Fatalf("Format = %q, want %q", result.Format, wantFormat)
+					}
+					if len(result.Endpoints) != 1 || result.Endpoints[0].Protocol != document.protocol {
+						t.Fatalf("Endpoints = %#v, want one %q endpoint", result.Endpoints, document.protocol)
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestParseWholeDocumentBase64Variants(t *testing.T) {
 	t.Parallel()
 
@@ -182,6 +261,7 @@ func TestParseClashYAML(t *testing.T) {
 	if vless.Transport.Type != domain.TransportTCP || !vless.TLS.Enabled || vless.TLS.ServerName != "reality.example.com" {
 		t.Fatalf("VLESS TLS/transport mapping is incomplete: %#v", vless)
 	}
+	assertRealityTLS(t, vless, testRealityPublicKey, "0123456789abcdef", domain.UTLSFingerprintFirefox)
 	vmess := endpointByProtocol(t, result.Endpoints, domain.ProtocolVMess)
 	if vmess.Transport != (domain.TransportOptions{Type: domain.TransportGRPC, ServiceName: "clash.Service"}) {
 		t.Fatalf("VMess transport = %#v, want Clash gRPC mapping", vmess.Transport)
@@ -211,6 +291,7 @@ func TestParseSingBoxJSON(t *testing.T) {
 	if vless.Transport != (domain.TransportOptions{Type: domain.TransportHTTPUpgrade, Path: "/upgrade", Host: "upgrade.example.com"}) {
 		t.Fatalf("VLESS transport = %#v, want sing-box HTTPUpgrade mapping", vless.Transport)
 	}
+	assertRealityTLS(t, vless, testRealityPublicKey, "abcd", domain.UTLSFingerprintSafari)
 	trojan := endpointByProtocol(t, result.Endpoints, domain.ProtocolTrojan)
 	if trojan.Transport != (domain.TransportOptions{Type: domain.TransportWebSocket, Path: "/trojan", Host: "cdn.example.com"}) {
 		t.Fatalf("Trojan transport = %#v, want bounded Host header only", trojan.Transport)
@@ -222,6 +303,110 @@ func TestParseSingBoxJSON(t *testing.T) {
 	}
 	if strings.Contains(string(encoded), "ignored") || strings.Contains(string(encoded), "X-Secret") {
 		t.Fatalf("parsed endpoints preserved unsupported provider configuration: %s", encoded)
+	}
+}
+
+func TestParseOnlyUnescapesURIFragmentDisplayNames(t *testing.T) {
+	t.Parallel()
+
+	vmessPayload := base64.StdEncoding.EncodeToString([]byte(`{
+		"ps":"VMess%20Literal",
+		"add":"vmess-name.example.com",
+		"port":"443",
+		"id":"550e8400-e29b-41d4-a716-446655440000",
+		"aid":"0",
+		"scy":"auto",
+		"net":"tcp"
+	}`))
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "URI fragment",
+			body: "ss://YWVzLTI1Ni1nY206c2VjcmV0@name.example.com:8388#URI%20Decoded",
+			want: "URI Decoded",
+		},
+		{name: "VMess ps", body: "vmess://" + vmessPayload, want: "VMess%20Literal"},
+		{
+			name: "Clash name",
+			body: `proxies:
+  - name: Clash%20Literal
+    type: ss
+    server: clash-name.example.com
+    port: 8388
+    cipher: aes-256-gcm
+    password: secret
+`,
+			want: "Clash%20Literal",
+		},
+		{
+			name: "sing-box tag",
+			body: `{"outbounds":[{"type":"shadowsocks","tag":"Sing%20Literal","server":"sing-name.example.com","server_port":8388,"method":"aes-256-gcm","password":"secret"}]}`,
+			want: "Sing%20Literal",
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			result, err := Parse(testSubscriptionID, []byte(test.body))
+			if err != nil {
+				t.Fatalf("Parse() returned an unexpected error: %v", err)
+			}
+			if len(result.Endpoints) != 1 || result.Endpoints[0].Name != test.want {
+				t.Fatalf("endpoint name = %q, want %q", result.Endpoints[0].Name, test.want)
+			}
+		})
+	}
+}
+
+func TestParseVMessRequiresJSONEOF(t *testing.T) {
+	t.Parallel()
+
+	valid := `{
+		"ps":"VMess",
+		"add":"vmess.example.com",
+		"port":"443",
+		"id":"550e8400-e29b-41d4-a716-446655440000",
+		"aid":"0",
+		"scy":"auto",
+		"net":"tcp"
+	}`
+	payload := base64.StdEncoding.EncodeToString([]byte(valid + `{"trailing":"object"}`))
+	result, err := Parse(testSubscriptionID, []byte("vmess://"+payload))
+	if err == nil {
+		t.Fatal("Parse() returned nil error, want trailing VMess JSON rejection")
+	}
+	if len(result.Endpoints) != 0 {
+		t.Fatalf("len(Endpoints) = %d, want none", len(result.Endpoints))
+	}
+}
+
+func TestParseVMessGRPCUsesPathAsServiceName(t *testing.T) {
+	t.Parallel()
+
+	payload := base64.StdEncoding.EncodeToString([]byte(`{
+		"ps":"VMess gRPC",
+		"add":"vmess-grpc.example.com",
+		"port":"443",
+		"id":"550e8400-e29b-41d4-a716-446655440000",
+		"aid":"0",
+		"scy":"auto",
+		"net":"grpc",
+		"path":"vmess.Service",
+		"tls":"tls",
+		"sni":"vmess-grpc.example.com"
+	}`))
+	result, err := Parse(testSubscriptionID, []byte("vmess://"+payload))
+	if err != nil {
+		t.Fatalf("Parse() returned an unexpected error: %v", err)
+	}
+	want := domain.TransportOptions{Type: domain.TransportGRPC, ServiceName: "vmess.Service"}
+	if len(result.Endpoints) != 1 || result.Endpoints[0].Transport != want {
+		t.Fatalf("Transport = %#v, want %#v", result.Endpoints[0].Transport, want)
 	}
 }
 
@@ -256,6 +441,36 @@ func TestParseShadowsocksSIP002Variants(t *testing.T) {
 				t.Fatalf("Endpoint = %#v, want method %q, password %q, host %q", endpoint, test.method, test.password, test.host)
 			}
 		})
+	}
+}
+
+func TestParseRealityCredentialsAffectNormalizedEndpointID(t *testing.T) {
+	t.Parallel()
+
+	firstLink := "vless://550e8400-e29b-41d4-a716-446655440000@reality.example.com:443?security=reality&pbk=" + testRealityPublicKey + "&sid=abcd&fp=chrome#One"
+	secondLink := strings.Replace(firstLink, "sid=abcd", "sid=1234", 1)
+	result, err := Parse(testSubscriptionID, []byte(firstLink+"\n"+secondLink))
+	if err != nil {
+		t.Fatalf("Parse() returned an unexpected error: %v", err)
+	}
+	if len(result.Endpoints) != 2 {
+		t.Fatalf("len(Endpoints) = %d, want Reality credentials to produce distinct IDs", len(result.Endpoints))
+	}
+	if result.Endpoints[0].ID == result.Endpoints[1].ID {
+		t.Fatalf("Reality endpoint IDs are equal: %q", result.Endpoints[0].ID)
+	}
+}
+
+func TestParseRejectsRealityWithoutPublicKey(t *testing.T) {
+	t.Parallel()
+
+	link := "vless://550e8400-e29b-41d4-a716-446655440000@reality.example.com:443?security=reality&sid=abcd&fp=chrome#MissingKey"
+	result, err := Parse(testSubscriptionID, []byte(link))
+	if err == nil {
+		t.Fatal("Parse() returned nil error, want missing Reality public key rejection")
+	}
+	if len(result.Endpoints) != 0 {
+		t.Fatalf("len(Endpoints) = %d, want none", len(result.Endpoints))
 	}
 }
 
@@ -387,8 +602,39 @@ func TestParseWarningsAreRedacted(t *testing.T) {
 		}
 	}
 	for index, warning := range result.Warnings {
+		if warning.SubscriptionID != testSubscriptionID {
+			t.Fatalf("warning %d subscription ID = %q, want %q", index, warning.SubscriptionID, testSubscriptionID)
+		}
 		if warning.Entry < 1 || warning.Message == "" {
 			t.Fatalf("warning %d is not actionable: %#v", index, warning)
+		}
+	}
+}
+
+func TestParseWarningsRedactURLLikeSubscriptionIdentifiers(t *testing.T) {
+	t.Parallel()
+
+	sensitiveID := "https://user:subscription-password@source.example.com/list?token=query-secret"
+	result, err := Parse(sensitiveID, readFixture(t, "redacted-warnings.txt"))
+	if err != nil {
+		t.Fatalf("Parse() returned an unexpected error: %v", err)
+	}
+	if len(result.Warnings) == 0 {
+		t.Fatal("Warnings = none, want redacted warning context")
+	}
+	encoded, err := json.Marshal(result.Warnings)
+	if err != nil {
+		t.Fatalf("json.Marshal() failed: %v", err)
+	}
+	warningText := string(encoded)
+	for _, sensitive := range []string{sensitiveID, "subscription-password", "source.example.com", "query-secret"} {
+		if strings.Contains(warningText, sensitive) {
+			t.Fatalf("warnings leaked subscription source value %q: %s", sensitive, warningText)
+		}
+	}
+	for _, warning := range result.Warnings {
+		if warning.SubscriptionID == "" || len(warning.SubscriptionID) > domain.MaxIDLength {
+			t.Fatalf("warning subscription ID is not a bounded identifier: %q", warning.SubscriptionID)
 		}
 	}
 }
@@ -425,6 +671,16 @@ func assertTLS(t *testing.T, endpoint domain.Endpoint, serverName string, insecu
 	t.Helper()
 	if !endpoint.TLS.Enabled || endpoint.TLS.ServerName != serverName || endpoint.TLS.InsecureSkipVerify != insecure || fmt.Sprint(endpoint.TLS.ALPN) != fmt.Sprint(alpn) {
 		t.Fatalf("TLS = %#v, want enabled, server name %q, insecure %t, ALPN %v", endpoint.TLS, serverName, insecure, alpn)
+	}
+}
+
+func assertRealityTLS(t *testing.T, endpoint domain.Endpoint, publicKey, shortID string, fingerprint domain.UTLSFingerprint) {
+	t.Helper()
+	if endpoint.TLS.Reality == nil {
+		t.Fatal("TLS.Reality = nil, want parsed Reality client options")
+	}
+	if endpoint.TLS.Reality.PublicKey != publicKey || endpoint.TLS.Reality.ShortID != shortID || endpoint.TLS.UTLSFingerprint != fingerprint {
+		t.Fatalf("TLS Reality/uTLS = %#v/%q, want public key %q, short ID %q, fingerprint %q", endpoint.TLS.Reality, endpoint.TLS.UTLSFingerprint, publicKey, shortID, fingerprint)
 	}
 }
 

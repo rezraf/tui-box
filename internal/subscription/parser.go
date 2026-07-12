@@ -29,9 +29,10 @@ var (
 )
 
 type Warning struct {
-	Entry   int    `json:"entry"`
-	Code    string `json:"code"`
-	Message string `json:"message"`
+	SubscriptionID string `json:"subscription_id"`
+	Entry          int    `json:"entry"`
+	Code           string `json:"code"`
+	Message        string `json:"message"`
 }
 
 type ParseResult struct {
@@ -55,14 +56,14 @@ func Parse(subscriptionID string, document []byte) (ParseResult, error) {
 }
 
 func parseDetected(subscriptionID string, content []byte, allowBase64 bool) (ParseResult, error) {
-	if looksLikeURIList(content) {
-		return finishResult(parseURIList(subscriptionID, content))
-	}
 	if content[0] == '{' {
 		return finishResult(parseSingBox(subscriptionID, content))
 	}
 	if looksLikeClash(content) {
 		return finishResult(parseClash(subscriptionID, content))
+	}
+	if looksLikeURIList(content) {
+		return finishResult(parseURIList(subscriptionID, content))
 	}
 	if allowBase64 {
 		if decoded, ok := decodeBase64Document(content); ok {
@@ -104,7 +105,7 @@ func addEndpoint(result *ParseResult, endpoint domain.Endpoint, subscriptionID s
 	normalizeEndpoint(&endpoint)
 	endpoint.ID = endpointID(endpoint)
 	if err := endpoint.Validate(); err != nil {
-		result.Warnings = append(result.Warnings, invalidWarning(entry))
+		result.Warnings = append(result.Warnings, invalidWarning(subscriptionID, entry))
 		return
 	}
 	if _, duplicate := seen[endpoint.ID]; duplicate {
@@ -153,12 +154,46 @@ func defaultEndpointName(protocol domain.Protocol) string {
 	}
 }
 
-func invalidWarning(entry int) Warning {
-	return Warning{Entry: entry, Code: "entry_skipped", Message: fmt.Sprintf("entry %d was skipped because it is malformed or unsupported", entry)}
+func invalidWarning(subscriptionID string, entry int) Warning {
+	return Warning{
+		SubscriptionID: warningSubscriptionID(subscriptionID),
+		Entry:          entry,
+		Code:           "entry_skipped",
+		Message:        fmt.Sprintf("entry %d was skipped because it is malformed or unsupported", entry),
+	}
 }
 
-func oversizedWarning(entry int) Warning {
-	return Warning{Entry: entry, Code: "entry_too_large", Message: fmt.Sprintf("entry %d was skipped because it exceeds the size limit", entry)}
+func oversizedWarning(subscriptionID string, entry int) Warning {
+	return Warning{
+		SubscriptionID: warningSubscriptionID(subscriptionID),
+		Entry:          entry,
+		Code:           "entry_too_large",
+		Message:        fmt.Sprintf("entry %d was skipped because it exceeds the size limit", entry),
+	}
+}
+
+func warningSubscriptionID(value string) string {
+	if len(value) <= domain.MaxIDLength {
+		safe := true
+		for _, character := range value {
+			if !isSafeIdentifierCharacter(character) {
+				safe = false
+				break
+			}
+		}
+		if safe {
+			return value
+		}
+	}
+	digest := sha256.Sum256([]byte(value))
+	return "subscription-" + hex.EncodeToString(digest[:8])
+}
+
+func isSafeIdentifierCharacter(character rune) bool {
+	return character >= 'a' && character <= 'z' ||
+		character >= 'A' && character <= 'Z' ||
+		character >= '0' && character <= '9' ||
+		character == '-' || character == '_' || character == '.'
 }
 
 func validSubscriptionID(value string) bool {

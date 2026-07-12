@@ -2,7 +2,6 @@ package subscription
 
 import (
 	"errors"
-	"net/url"
 	"strconv"
 	"strings"
 
@@ -15,33 +14,34 @@ type clashDocument struct {
 }
 
 type clashProxy struct {
-	Name           string                  `yaml:"name"`
-	Type           string                  `yaml:"type"`
-	Server         string                  `yaml:"server"`
-	Port           int                     `yaml:"port"`
-	UUID           string                  `yaml:"uuid"`
-	Password       string                  `yaml:"password"`
-	Cipher         string                  `yaml:"cipher"`
-	AlterID        int                     `yaml:"alterId"`
-	TLS            bool                    `yaml:"tls"`
-	ServerName     string                  `yaml:"servername"`
-	SNI            string                  `yaml:"sni"`
-	SkipCertVerify bool                    `yaml:"skip-cert-verify"`
-	ALPN           yamlStringList          `yaml:"alpn"`
-	Network        string                  `yaml:"network"`
-	Flow           string                  `yaml:"flow"`
-	PacketEncoding string                  `yaml:"packet-encoding"`
-	WSOptions      clashWebSocketOptions   `yaml:"ws-opts"`
-	GRPCOptions    clashGRPCOptions        `yaml:"grpc-opts"`
-	HTTPUpgrade    clashHTTPUpgradeOptions `yaml:"http-upgrade-opts"`
-	RealityOptions *clashRealityOptions    `yaml:"reality-opts"`
-	Obfs           string                  `yaml:"obfs"`
-	ObfsPassword   string                  `yaml:"obfs-password"`
-	UpMbps         yamlMbps                `yaml:"up"`
-	DownMbps       yamlMbps                `yaml:"down"`
-	Congestion     string                  `yaml:"congestion-controller"`
-	UDPRelayMode   string                  `yaml:"udp-relay-mode"`
-	ReduceRTT      bool                    `yaml:"reduce-rtt"`
+	Name              string                  `yaml:"name"`
+	Type              string                  `yaml:"type"`
+	Server            string                  `yaml:"server"`
+	Port              int                     `yaml:"port"`
+	UUID              string                  `yaml:"uuid"`
+	Password          string                  `yaml:"password"`
+	Cipher            string                  `yaml:"cipher"`
+	AlterID           int                     `yaml:"alterId"`
+	TLS               bool                    `yaml:"tls"`
+	ServerName        string                  `yaml:"servername"`
+	SNI               string                  `yaml:"sni"`
+	SkipCertVerify    bool                    `yaml:"skip-cert-verify"`
+	ALPN              yamlStringList          `yaml:"alpn"`
+	Network           string                  `yaml:"network"`
+	Flow              string                  `yaml:"flow"`
+	PacketEncoding    string                  `yaml:"packet-encoding"`
+	ClientFingerprint string                  `yaml:"client-fingerprint"`
+	WSOptions         clashWebSocketOptions   `yaml:"ws-opts"`
+	GRPCOptions       clashGRPCOptions        `yaml:"grpc-opts"`
+	HTTPUpgrade       clashHTTPUpgradeOptions `yaml:"http-upgrade-opts"`
+	RealityOptions    *clashRealityOptions    `yaml:"reality-opts"`
+	Obfs              string                  `yaml:"obfs"`
+	ObfsPassword      string                  `yaml:"obfs-password"`
+	UpMbps            yamlMbps                `yaml:"up"`
+	DownMbps          yamlMbps                `yaml:"down"`
+	Congestion        string                  `yaml:"congestion-controller"`
+	UDPRelayMode      string                  `yaml:"udp-relay-mode"`
+	ReduceRTT         bool                    `yaml:"reduce-rtt"`
 }
 
 type clashRealityOptions struct {
@@ -141,21 +141,21 @@ func parseClash(subscriptionID string, content []byte) (ParseResult, error) {
 		node := &document.Proxies[index]
 		encoded, err := yaml.Marshal(node)
 		if err != nil || len(encoded) > MaxEntryBytes {
-			result.Warnings = append(result.Warnings, oversizedWarning(entryNumber))
+			result.Warnings = append(result.Warnings, oversizedWarning(subscriptionID, entryNumber))
 			continue
 		}
 		if containsYAMLAlias(node) {
-			result.Warnings = append(result.Warnings, invalidWarning(entryNumber))
+			result.Warnings = append(result.Warnings, invalidWarning(subscriptionID, entryNumber))
 			continue
 		}
 		var proxy clashProxy
 		if err := node.Decode(&proxy); err != nil {
-			result.Warnings = append(result.Warnings, invalidWarning(entryNumber))
+			result.Warnings = append(result.Warnings, invalidWarning(subscriptionID, entryNumber))
 			continue
 		}
 		endpoint, err := proxy.endpoint()
 		if err != nil {
-			result.Warnings = append(result.Warnings, invalidWarning(entryNumber))
+			result.Warnings = append(result.Warnings, invalidWarning(subscriptionID, entryNumber))
 			continue
 		}
 		addEndpoint(&result, endpoint, subscriptionID, entryNumber, seen)
@@ -164,16 +164,12 @@ func parseClash(subscriptionID string, content []byte) (ParseResult, error) {
 }
 
 func (proxy clashProxy) endpoint() (domain.Endpoint, error) {
-	name, err := url.PathUnescape(proxy.Name)
-	if err != nil {
-		return domain.Endpoint{}, errInvalidEntry
-	}
 	protocol, err := clashProtocol(proxy.Type)
 	if err != nil {
 		return domain.Endpoint{}, err
 	}
 	endpoint := domain.Endpoint{
-		Name:     name,
+		Name:     proxy.Name,
 		Protocol: protocol,
 		Host:     proxy.Server,
 		Port:     proxy.Port,
@@ -188,9 +184,13 @@ func (proxy clashProxy) endpoint() (domain.Endpoint, error) {
 		ServerName:         serverName,
 		InsecureSkipVerify: proxy.SkipCertVerify,
 		ALPN:               []string(proxy.ALPN),
+		UTLSFingerprint:    domain.UTLSFingerprint(proxy.ClientFingerprint),
 	}
-	if !endpoint.TLS.Enabled {
-		endpoint.TLS = domain.TLSOptions{}
+	if proxy.RealityOptions != nil {
+		endpoint.TLS.Reality = &domain.RealityClientOptions{
+			PublicKey: proxy.RealityOptions.PublicKey,
+			ShortID:   proxy.RealityOptions.ShortID,
+		}
 	}
 
 	switch protocol {

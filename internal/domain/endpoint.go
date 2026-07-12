@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"encoding/base64"
 	"fmt"
 	"net"
 	"strings"
@@ -9,15 +10,18 @@ import (
 )
 
 const (
-	MaxIDLength             = 128
-	MaxNameLength           = 256
-	MaxHostLength           = 253
-	MaxUUIDLength           = 36
-	MaxCredentialLength     = 1024
-	MaxMethodLength         = 128
-	MaxTLSFieldLength       = 255
-	MaxTransportFieldLength = 2048
-	MaxALPNValues           = 16
+	MaxIDLength               = 128
+	MaxNameLength             = 256
+	MaxHostLength             = 253
+	MaxUUIDLength             = 36
+	MaxCredentialLength       = 1024
+	MaxMethodLength           = 128
+	MaxTLSFieldLength         = 255
+	MaxRealityPublicKeyLength = 64
+	MaxRealityShortIDLength   = 16
+	MaxUTLSFingerprintLength  = 32
+	MaxTransportFieldLength   = 2048
+	MaxALPNValues             = 16
 )
 
 type Protocol string
@@ -31,11 +35,33 @@ const (
 	ProtocolTUIC        Protocol = "tuic"
 )
 
+type UTLSFingerprint string
+
+const (
+	UTLSFingerprintChrome     UTLSFingerprint = "chrome"
+	UTLSFingerprintFirefox    UTLSFingerprint = "firefox"
+	UTLSFingerprintEdge       UTLSFingerprint = "edge"
+	UTLSFingerprintSafari     UTLSFingerprint = "safari"
+	UTLSFingerprint360        UTLSFingerprint = "360"
+	UTLSFingerprintQQ         UTLSFingerprint = "qq"
+	UTLSFingerprintIOS        UTLSFingerprint = "ios"
+	UTLSFingerprintAndroid    UTLSFingerprint = "android"
+	UTLSFingerprintRandom     UTLSFingerprint = "random"
+	UTLSFingerprintRandomized UTLSFingerprint = "randomized"
+)
+
+type RealityClientOptions struct {
+	PublicKey string `json:"public_key"`
+	ShortID   string `json:"short_id,omitempty"`
+}
+
 type TLSOptions struct {
-	Enabled            bool     `json:"enabled"`
-	ServerName         string   `json:"server_name,omitempty"`
-	InsecureSkipVerify bool     `json:"insecure_skip_verify,omitempty"`
-	ALPN               []string `json:"alpn,omitempty"`
+	Enabled            bool                  `json:"enabled"`
+	ServerName         string                `json:"server_name,omitempty"`
+	InsecureSkipVerify bool                  `json:"insecure_skip_verify,omitempty"`
+	ALPN               []string              `json:"alpn,omitempty"`
+	Reality            *RealityClientOptions `json:"reality,omitempty"`
+	UTLSFingerprint    UTLSFingerprint       `json:"utls_fingerprint,omitempty"`
 }
 
 type TransportType string
@@ -223,7 +249,7 @@ func (protocol Protocol) isSupported() bool {
 
 func (options TLSOptions) validate() error {
 	if !options.Enabled {
-		if options.ServerName != "" || options.InsecureSkipVerify || len(options.ALPN) != 0 {
+		if options.ServerName != "" || options.InsecureSkipVerify || len(options.ALPN) != 0 || options.Reality != nil || options.UTLSFingerprint != "" {
 			return fmt.Errorf("TLS options require TLS to be enabled")
 		}
 		return nil
@@ -241,7 +267,48 @@ func (options TLSOptions) validate() error {
 			return err
 		}
 	}
+	if options.Reality != nil {
+		if err := options.Reality.validate(); err != nil {
+			return err
+		}
+	}
+	return options.UTLSFingerprint.validate()
+}
+
+func (options RealityClientOptions) validate() error {
+	if err := validateString("Reality public key", options.PublicKey, MaxRealityPublicKeyLength, true); err != nil {
+		return err
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(options.PublicKey)
+	if err != nil || len(decoded) != 32 {
+		return fmt.Errorf("Reality public key is invalid")
+	}
+	if err := validateString("Reality short ID", options.ShortID, MaxRealityShortIDLength, false); err != nil {
+		return err
+	}
+	if len(options.ShortID)%2 != 0 {
+		return fmt.Errorf("Reality short ID is invalid")
+	}
+	for _, character := range options.ShortID {
+		if !isHex(character) {
+			return fmt.Errorf("Reality short ID is invalid")
+		}
+	}
 	return nil
+}
+
+func (fingerprint UTLSFingerprint) validate() error {
+	if err := validateString("uTLS fingerprint", string(fingerprint), MaxUTLSFingerprintLength, false); err != nil {
+		return err
+	}
+	switch fingerprint {
+	case "", UTLSFingerprintChrome, UTLSFingerprintFirefox, UTLSFingerprintEdge, UTLSFingerprintSafari,
+		UTLSFingerprint360, UTLSFingerprintQQ, UTLSFingerprintIOS, UTLSFingerprintAndroid,
+		UTLSFingerprintRandom, UTLSFingerprintRandomized:
+		return nil
+	default:
+		return fmt.Errorf("unsupported uTLS fingerprint")
+	}
 }
 
 func (options TransportOptions) validate() error {

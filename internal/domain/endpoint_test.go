@@ -6,7 +6,10 @@ import (
 	"testing"
 )
 
-const validUUID = "550e8400-e29b-41d4-a716-446655440000"
+const (
+	validUUID             = "550e8400-e29b-41d4-a716-446655440000"
+	validRealityPublicKey = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
+)
 
 func TestEndpointValidateAcceptsSupportedProtocols(t *testing.T) {
 	t.Parallel()
@@ -168,10 +171,106 @@ func TestEndpointValidateAcceptsTLSOptions(t *testing.T) {
 		ServerName:         "edge.example.com",
 		InsecureSkipVerify: true,
 		ALPN:               []string{"h2", "http/1.1"},
+		Reality: &RealityClientOptions{
+			PublicKey: validRealityPublicKey,
+			ShortID:   "0123456789abcdef",
+		},
+		UTLSFingerprint: UTLSFingerprintChrome,
 	}
 
 	if err := endpoint.Validate(); err != nil {
 		t.Fatalf("Validate() returned an unexpected error: %v", err)
+	}
+}
+
+func TestEndpointTLSRealityJSONRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	original := validEndpoint()
+	original.TLS = TLSOptions{
+		Enabled: true,
+		Reality: &RealityClientOptions{
+			PublicKey: validRealityPublicKey,
+			ShortID:   "abcd",
+		},
+		UTLSFingerprint: UTLSFingerprintFirefox,
+	}
+
+	encoded, err := json.Marshal(original)
+	if err != nil {
+		t.Fatalf("json.Marshal() returned an unexpected error: %v", err)
+	}
+	var roundTripped Endpoint
+	if err := json.Unmarshal(encoded, &roundTripped); err != nil {
+		t.Fatalf("json.Unmarshal() returned an unexpected error: %v", err)
+	}
+	if roundTripped.TLS.Reality == nil {
+		t.Fatal("TLS.Reality = nil, want Reality client options")
+	}
+	if *roundTripped.TLS.Reality != *original.TLS.Reality {
+		t.Fatalf("TLS.Reality = %#v, want %#v", roundTripped.TLS.Reality, original.TLS.Reality)
+	}
+	if roundTripped.TLS.UTLSFingerprint != original.TLS.UTLSFingerprint {
+		t.Fatalf("TLS.UTLSFingerprint = %q, want %q", roundTripped.TLS.UTLSFingerprint, original.TLS.UTLSFingerprint)
+	}
+	if err := roundTripped.Validate(); err != nil {
+		t.Fatalf("round-tripped endpoint did not validate: %v", err)
+	}
+}
+
+func TestEndpointValidateRejectsInvalidRealityAndUTLSOptions(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		mutate func(*Endpoint)
+	}{
+		{name: "Reality without TLS", mutate: func(endpoint *Endpoint) {
+			endpoint.TLS.Reality = &RealityClientOptions{PublicKey: validRealityPublicKey}
+		}},
+		{name: "uTLS without TLS", mutate: func(endpoint *Endpoint) {
+			endpoint.TLS.UTLSFingerprint = UTLSFingerprintChrome
+		}},
+		{name: "Reality without public key", mutate: func(endpoint *Endpoint) {
+			endpoint.TLS = TLSOptions{Enabled: true, Reality: &RealityClientOptions{ShortID: "abcd"}}
+		}},
+		{name: "malformed Reality public key", mutate: func(endpoint *Endpoint) {
+			endpoint.TLS = TLSOptions{Enabled: true, Reality: &RealityClientOptions{PublicKey: "not-a-key"}}
+		}},
+		{name: "wrong-size Reality public key", mutate: func(endpoint *Endpoint) {
+			endpoint.TLS = TLSOptions{Enabled: true, Reality: &RealityClientOptions{PublicKey: "YQ"}}
+		}},
+		{name: "non-hex Reality short ID", mutate: func(endpoint *Endpoint) {
+			endpoint.TLS = TLSOptions{Enabled: true, Reality: &RealityClientOptions{PublicKey: validRealityPublicKey, ShortID: "not-hex"}}
+		}},
+		{name: "odd-length Reality short ID", mutate: func(endpoint *Endpoint) {
+			endpoint.TLS = TLSOptions{Enabled: true, Reality: &RealityClientOptions{PublicKey: validRealityPublicKey, ShortID: "abc"}}
+		}},
+		{name: "oversized Reality public key", mutate: func(endpoint *Endpoint) {
+			endpoint.TLS = TLSOptions{Enabled: true, Reality: &RealityClientOptions{PublicKey: strings.Repeat("a", MaxRealityPublicKeyLength+1)}}
+		}},
+		{name: "oversized Reality short ID", mutate: func(endpoint *Endpoint) {
+			endpoint.TLS = TLSOptions{Enabled: true, Reality: &RealityClientOptions{PublicKey: validRealityPublicKey, ShortID: strings.Repeat("a", MaxRealityShortIDLength+1)}}
+		}},
+		{name: "unsupported uTLS fingerprint", mutate: func(endpoint *Endpoint) {
+			endpoint.TLS = TLSOptions{Enabled: true, UTLSFingerprint: UTLSFingerprint("netscape")}
+		}},
+		{name: "oversized uTLS fingerprint", mutate: func(endpoint *Endpoint) {
+			endpoint.TLS = TLSOptions{Enabled: true, UTLSFingerprint: UTLSFingerprint(strings.Repeat("a", MaxUTLSFingerprintLength+1))}
+		}},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			endpoint := validEndpoint()
+			test.mutate(&endpoint)
+
+			if err := endpoint.Validate(); err == nil {
+				t.Fatal("Validate() returned nil, want an error")
+			}
+		})
 	}
 }
 

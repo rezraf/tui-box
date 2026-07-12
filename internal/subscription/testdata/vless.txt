@@ -1,1 +1,1 @@
-vless://550e8400-e29b-41d4-a716-446655440000@vless.example.com:443?encryption=none&security=reality&sni=front.example.com&fp=chrome&pbk=public-key&sid=abcd&type=ws&path=%2Fws&host=cdn.example.com&alpn=h2%2Chttp%2F1.1#VLESS%20Reality
+vless://550e8400-e29b-41d4-a716-446655440000@vless.example.com:443?encryption=none&security=reality&sni=front.example.com&fp=chrome&pbk=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8&sid=abcd&type=ws&path=%2Fws&host=cdn.example.com&alpn=h2%2Chttp%2F1.1#VLESS%20Reality

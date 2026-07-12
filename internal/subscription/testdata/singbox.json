@@ -12,7 +12,8 @@
         "enabled": true,
         "server_name": "reality.example.com",
         "alpn": ["h2", "http/1.1"],
-        "reality": {"enabled": true, "public_key": "ignored", "short_id": "ignored"}
+        "reality": {"enabled": true, "public_key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8", "short_id": "abcd"},
+        "utls": {"enabled": true, "fingerprint": "safari"}
       },
       "transport": {"type": "httpupgrade", "path": "/upgrade", "host": "upgrade.example.com"}
     },

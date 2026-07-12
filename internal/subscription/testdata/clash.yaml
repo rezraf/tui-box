@@ -10,9 +10,10 @@ proxies:
     flow: xtls-rprx-vision
     network: tcp
     packet-encoding: xudp
+    client-fingerprint: firefox
     reality-opts:
-      public-key: ignored-public-key
-      short-id: ignored-short-id
+      public-key: AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8
+      short-id: 0123456789abcdef
   - name: VMess Clash
     type: vmess
     server: clash-vmess.example.com

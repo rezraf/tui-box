@@ -31,12 +31,12 @@ func parseURIList(subscriptionID string, content []byte) (ParseResult, error) {
 			return ParseResult{}, errTooManyEntries
 		}
 		if len(entry) > MaxEntryBytes {
-			result.Warnings = append(result.Warnings, oversizedWarning(entryIndex))
+			result.Warnings = append(result.Warnings, oversizedWarning(subscriptionID, entryIndex))
 			continue
 		}
 		endpoint, err := parseURIEntry(entry)
 		if err != nil {
-			result.Warnings = append(result.Warnings, invalidWarning(entryIndex))
+			result.Warnings = append(result.Warnings, invalidWarning(subscriptionID, entryIndex))
 			continue
 		}
 		addEndpoint(&result, endpoint, subscriptionID, entryIndex, seen)
@@ -134,6 +134,9 @@ func parseVMess(entry string) (domain.Endpoint, error) {
 	if err := decoder.Decode(&link); err != nil {
 		return domain.Endpoint{}, errInvalidEntry
 	}
+	if err := requireJSONEOF(decoder); err != nil {
+		return domain.Endpoint{}, errInvalidEntry
+	}
 	port, err := rawInteger(link.Port, false)
 	if err != nil {
 		return domain.Endpoint{}, errInvalidEntry
@@ -142,11 +145,13 @@ func parseVMess(entry string) (domain.Endpoint, error) {
 	if err != nil {
 		return domain.Endpoint{}, errInvalidEntry
 	}
-	transport, err := transportFromValues(link.Network, link.Path, link.TransportHost, "")
-	if err != nil {
-		return domain.Endpoint{}, errInvalidEntry
+	transportPath := link.Path
+	serviceName := ""
+	if strings.EqualFold(link.Network, "grpc") {
+		transportPath = ""
+		serviceName = link.Path
 	}
-	name, err := url.PathUnescape(link.Name)
+	transport, err := transportFromValues(link.Network, transportPath, link.TransportHost, serviceName)
 	if err != nil {
 		return domain.Endpoint{}, errInvalidEntry
 	}
@@ -156,7 +161,7 @@ func parseVMess(entry string) (domain.Endpoint, error) {
 	}
 	tlsEnabled := link.TLS == "tls" || link.TLS == "reality"
 	return domain.Endpoint{
-		Name:     name,
+		Name:     link.Name,
 		Protocol: domain.ProtocolVMess,
 		Host:     link.Host,
 		Port:     port,
@@ -340,12 +345,21 @@ func queryTLS(query url.Values, required bool) (domain.TLSOptions, error) {
 	if err != nil {
 		return domain.TLSOptions{}, errInvalidEntry
 	}
-	return domain.TLSOptions{
+	options := domain.TLSOptions{
 		Enabled:            enabled,
 		ServerName:         firstValue(query, "sni", "serverName", "peer"),
 		InsecureSkipVerify: insecure,
 		ALPN:               splitList(firstValue(query, "alpn")),
-	}, nil
+		UTLSFingerprint:    domain.UTLSFingerprint(firstValue(query, "fp")),
+	}
+	publicKey := firstValue(query, "pbk")
+	shortID := firstValue(query, "sid")
+	if security == "reality" {
+		options.Reality = &domain.RealityClientOptions{PublicKey: publicKey, ShortID: shortID}
+	} else if publicKey != "" || shortID != "" {
+		return domain.TLSOptions{}, errInvalidEntry
+	}
+	return options, nil
 }
 
 func queryTransport(query url.Values) (domain.TransportOptions, error) {

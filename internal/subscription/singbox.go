@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
-	"net/url"
 	"strings"
 
 	"github.com/rezraf/tui-box/internal/domain"
@@ -37,10 +36,23 @@ type singBoxOutbound struct {
 }
 
 type singBoxTLS struct {
-	Enabled    bool     `json:"enabled"`
-	ServerName string   `json:"server_name"`
-	Insecure   bool     `json:"insecure"`
-	ALPN       []string `json:"alpn"`
+	Enabled    bool            `json:"enabled"`
+	ServerName string          `json:"server_name"`
+	Insecure   bool            `json:"insecure"`
+	ALPN       []string        `json:"alpn"`
+	Reality    *singBoxReality `json:"reality"`
+	UTLS       *singBoxUTLS    `json:"utls"`
+}
+
+type singBoxReality struct {
+	Enabled   bool   `json:"enabled"`
+	PublicKey string `json:"public_key"`
+	ShortID   string `json:"short_id"`
+}
+
+type singBoxUTLS struct {
+	Enabled     bool   `json:"enabled"`
+	Fingerprint string `json:"fingerprint"`
 }
 
 type singBoxTransport struct {
@@ -77,17 +89,17 @@ func parseSingBox(subscriptionID string, content []byte) (ParseResult, error) {
 	for index, raw := range document.Outbounds {
 		entryNumber := index + 1
 		if len(raw) > MaxEntryBytes {
-			result.Warnings = append(result.Warnings, oversizedWarning(entryNumber))
+			result.Warnings = append(result.Warnings, oversizedWarning(subscriptionID, entryNumber))
 			continue
 		}
 		var outbound singBoxOutbound
 		if err := json.Unmarshal(raw, &outbound); err != nil {
-			result.Warnings = append(result.Warnings, invalidWarning(entryNumber))
+			result.Warnings = append(result.Warnings, invalidWarning(subscriptionID, entryNumber))
 			continue
 		}
 		endpoint, err := outbound.endpoint()
 		if err != nil {
-			result.Warnings = append(result.Warnings, invalidWarning(entryNumber))
+			result.Warnings = append(result.Warnings, invalidWarning(subscriptionID, entryNumber))
 			continue
 		}
 		addEndpoint(&result, endpoint, subscriptionID, entryNumber, seen)
@@ -108,12 +120,8 @@ func (outbound singBoxOutbound) endpoint() (domain.Endpoint, error) {
 	if err != nil {
 		return domain.Endpoint{}, err
 	}
-	name, err := url.PathUnescape(outbound.Tag)
-	if err != nil {
-		return domain.Endpoint{}, errInvalidEntry
-	}
 	endpoint := domain.Endpoint{
-		Name:     name,
+		Name:     outbound.Tag,
 		Protocol: protocol,
 		Host:     outbound.Server,
 		Port:     outbound.ServerPort,
@@ -124,6 +132,15 @@ func (outbound singBoxOutbound) endpoint() (domain.Endpoint, error) {
 			ServerName:         outbound.TLS.ServerName,
 			InsecureSkipVerify: outbound.TLS.Insecure,
 			ALPN:               outbound.TLS.ALPN,
+		}
+		if outbound.TLS.Reality != nil && outbound.TLS.Reality.Enabled {
+			endpoint.TLS.Reality = &domain.RealityClientOptions{
+				PublicKey: outbound.TLS.Reality.PublicKey,
+				ShortID:   outbound.TLS.Reality.ShortID,
+			}
+		}
+		if outbound.TLS.UTLS != nil && outbound.TLS.UTLS.Enabled {
+			endpoint.TLS.UTLSFingerprint = domain.UTLSFingerprint(outbound.TLS.UTLS.Fingerprint)
 		}
 	}
 
