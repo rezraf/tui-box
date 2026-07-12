@@ -1,7 +1,9 @@
 package subscription
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -272,6 +274,36 @@ func TestParseClashYAML(t *testing.T) {
 	}
 }
 
+func TestParseClashRejectsTrailingDocumentsAndGarbage(t *testing.T) {
+	t.Parallel()
+
+	valid := `proxies:
+  - name: Primary
+    type: ss
+    server: clash.example.com
+    port: 8388
+    cipher: aes-256-gcm
+    password: secret
+`
+	for _, trailing := range []string{
+		"---\nproxies:\n  - name: Secondary\n    type: ss\n    server: second.example.com\n    port: 8388\n    cipher: aes-256-gcm\n    password: secret\n",
+		"---\n{\n",
+		"---\n",
+	} {
+		trailing := trailing
+		t.Run(fmt.Sprintf("%q", trailing), func(t *testing.T) {
+			t.Parallel()
+			result, err := Parse(testSubscriptionID, []byte(valid+trailing))
+			if err == nil {
+				t.Fatal("Parse() returned nil error, want trailing YAML rejection")
+			}
+			if len(result.Endpoints) != 0 {
+				t.Fatalf("len(Endpoints) = %d, want none", len(result.Endpoints))
+			}
+		})
+	}
+}
+
 func TestParseSingBoxJSON(t *testing.T) {
 	t.Parallel()
 
@@ -363,6 +395,49 @@ func TestParseOnlyUnescapesURIFragmentDisplayNames(t *testing.T) {
 	}
 }
 
+func TestParseSingBoxRejectsDuplicateJSONKeysAtAnyDepth(t *testing.T) {
+	t.Parallel()
+
+	outbound := `{"type":"shadowsocks","tag":"Strict JSON","server":"strict.example.com","server_port":8388,"method":"aes-256-gcm","password":"secret"}`
+	documents := []string{
+		`{"outbounds":[` + outbound + `],"outbounds":[` + outbound + `]}`,
+		`{"outbounds":[{"type":"shadowsocks","tag":"Strict JSON","server":"first.example.com","server":"second.example.com","server_port":8388,"method":"aes-256-gcm","password":"secret"}]}`,
+		`{"metadata":{"nested":{"value":1,"value":2}},"outbounds":[` + outbound + `]}`,
+	}
+	for _, document := range documents {
+		document := document
+		t.Run(document, func(t *testing.T) {
+			t.Parallel()
+			result, err := Parse(testSubscriptionID, []byte(document))
+			if err == nil {
+				t.Fatal("Parse() returned nil error, want duplicate JSON key rejection")
+			}
+			if len(result.Endpoints) != 0 {
+				t.Fatalf("len(Endpoints) = %d, want none", len(result.Endpoints))
+			}
+		})
+	}
+}
+
+func TestParseVMessRejectsDuplicateJSONKeys(t *testing.T) {
+	t.Parallel()
+
+	decoded := `{
+		"ps":"VMess",
+		"add":"first.example.com",
+		"add":"second.example.com",
+		"port":"443",
+		"id":"550e8400-e29b-41d4-a716-446655440000",
+		"aid":"0",
+		"scy":"auto",
+		"net":"tcp"
+	}`
+	payload := base64.StdEncoding.EncodeToString([]byte(decoded))
+	if _, err := parseVMess("vmess://" + payload); err == nil {
+		t.Fatal("parseVMess() returned nil error, want duplicate JSON key rejection")
+	}
+}
+
 func TestParseVMessRequiresJSONEOF(t *testing.T) {
 	t.Parallel()
 
@@ -449,15 +524,60 @@ func TestParseRealityCredentialsAffectNormalizedEndpointID(t *testing.T) {
 
 	firstLink := "vless://550e8400-e29b-41d4-a716-446655440000@reality.example.com:443?security=reality&pbk=" + testRealityPublicKey + "&sid=abcd&fp=chrome#One"
 	secondLink := strings.Replace(firstLink, "sid=abcd", "sid=1234", 1)
+	thirdLink := strings.Replace(firstLink, testRealityPublicKey, "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE", 1)
+	result, err := Parse(testSubscriptionID, []byte(strings.Join([]string{firstLink, secondLink, thirdLink}, "\n")))
+	if err != nil {
+		t.Fatalf("Parse() returned an unexpected error: %v", err)
+	}
+	if len(result.Endpoints) != 3 {
+		t.Fatalf("len(Endpoints) = %d, want Reality credentials to produce distinct IDs", len(result.Endpoints))
+	}
+	seen := make(map[string]struct{}, len(result.Endpoints))
+	for _, endpoint := range result.Endpoints {
+		if _, duplicate := seen[endpoint.ID]; duplicate {
+			t.Fatalf("duplicate Reality endpoint ID: %q", endpoint.ID)
+		}
+		seen[endpoint.ID] = struct{}{}
+	}
+}
+
+func TestParseCredentialsAffectNormalizedEndpointID(t *testing.T) {
+	t.Parallel()
+
+	firstLink := "ss://aes-256-gcm:first-credential@identity.example.com:8388#One"
+	secondLink := strings.Replace(firstLink, "first-credential", "second-credential", 1)
 	result, err := Parse(testSubscriptionID, []byte(firstLink+"\n"+secondLink))
 	if err != nil {
 		t.Fatalf("Parse() returned an unexpected error: %v", err)
 	}
 	if len(result.Endpoints) != 2 {
-		t.Fatalf("len(Endpoints) = %d, want Reality credentials to produce distinct IDs", len(result.Endpoints))
+		t.Fatalf("len(Endpoints) = %d, want credential differences to produce distinct IDs", len(result.Endpoints))
 	}
 	if result.Endpoints[0].ID == result.Endpoints[1].ID {
-		t.Fatalf("Reality endpoint IDs are equal: %q", result.Endpoints[0].ID)
+		t.Fatalf("credential-distinct endpoint IDs are equal: %q", result.Endpoints[0].ID)
+	}
+}
+
+func TestParseEndpointIDUsesVersionedCanonicalIdentity(t *testing.T) {
+	t.Parallel()
+
+	const password = "identity-secret"
+	result, err := Parse(testSubscriptionID, []byte("ss://aes-256-gcm:"+password+"@identity.example.com:8388#Identity"))
+	if err != nil {
+		t.Fatalf("Parse() returned an unexpected error: %v", err)
+	}
+	passwordDigest := sha256.Sum256([]byte(password))
+	canonical := fmt.Sprintf(
+		`{"version":1,"protocol":"shadowsocks","host":"identity.example.com","port":8388,"password_sha256":"%s","method":"aes-256-gcm","tls":{"enabled":false},"transport":{"type":""}}`,
+		hex.EncodeToString(passwordDigest[:]),
+	)
+	identityDigest := sha256.Sum256([]byte(canonical))
+	want := hex.EncodeToString(identityDigest[:])
+	if got := result.Endpoints[0].ID; got != want {
+		t.Fatalf("endpoint ID = %q, want canonical v1 ID %q", got, want)
+	}
+	if strings.Contains(result.Endpoints[0].ID, password) {
+		t.Fatal("endpoint ID exposed a raw credential")
 	}
 }
 
@@ -471,6 +591,80 @@ func TestParseRejectsRealityWithoutPublicKey(t *testing.T) {
 	}
 	if len(result.Endpoints) != 0 {
 		t.Fatalf("len(Endpoints) = %d, want none", len(result.Endpoints))
+	}
+}
+
+func TestParseVLESSRejectsDuplicateRecognizedQueryParameters(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		query string
+	}{
+		{name: "same key", query: "security=tls&security=tls"},
+		{name: "encryption indicator", query: "encryption=none&encryption=none"},
+		{name: "conflicting aliases", query: "type=ws&network=tcp"},
+		{name: "Reality public key", query: "security=reality&pbk=" + testRealityPublicKey + "&pbk=" + testRealityPublicKey},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if _, err := parseVLESS(testVLESSLink(test.query)); err == nil {
+				t.Fatal("parseVLESS() returned nil error, want duplicate query rejection")
+			}
+		})
+	}
+}
+
+func TestParseVLESSRejectsContradictoryTLSIndicators(t *testing.T) {
+	t.Parallel()
+
+	for _, query := range []string{
+		"security=tls&tls=false",
+		"security=reality&tls=false&pbk=" + testRealityPublicKey,
+		"security=none&tls=true",
+	} {
+		query := query
+		t.Run(query, func(t *testing.T) {
+			t.Parallel()
+			if _, err := parseVLESS(testVLESSLink(query)); err == nil {
+				t.Fatal("parseVLESS() returned nil error, want contradictory TLS rejection")
+			}
+		})
+	}
+}
+
+func TestParseVLESSParsesBooleansStrictly(t *testing.T) {
+	t.Parallel()
+
+	for _, query := range []string{
+		"tls=1",
+		"tls=TRUE",
+		"security=tls&insecure=yes",
+		"tls=",
+	} {
+		query := query
+		t.Run(query, func(t *testing.T) {
+			t.Parallel()
+			if _, err := parseVLESS(testVLESSLink(query)); err == nil {
+				t.Fatal("parseVLESS() returned nil error, want non-canonical boolean rejection")
+			}
+		})
+	}
+}
+
+func TestParseVLESSAcceptsCanonicalBooleans(t *testing.T) {
+	t.Parallel()
+
+	for _, query := range []string{"tls=true", "tls=false", "security=tls&insecure=false"} {
+		query := query
+		t.Run(query, func(t *testing.T) {
+			t.Parallel()
+			if _, err := parseVLESS(testVLESSLink(query)); err != nil {
+				t.Fatalf("parseVLESS() returned an unexpected error: %v", err)
+			}
+		})
 	}
 }
 
@@ -499,6 +693,53 @@ func TestParseDerivesStableCredentialSafeIDsAndDeduplicates(t *testing.T) {
 		if strings.Contains(first.Endpoints[0].ID, sensitive) {
 			t.Fatalf("ID contains source content %q", sensitive)
 		}
+	}
+}
+
+func TestParseRejectsInvalidUTF8InRawDocument(t *testing.T) {
+	t.Parallel()
+
+	document := append([]byte{0xff, '\n'}, readFixture(t, "shadowsocks.txt")...)
+	result, err := Parse(testSubscriptionID, document)
+	if err == nil {
+		t.Fatal("Parse() returned nil error, want invalid UTF-8 rejection")
+	}
+	if len(result.Endpoints) != 0 {
+		t.Fatalf("len(Endpoints) = %d, want none", len(result.Endpoints))
+	}
+}
+
+func TestParseRejectsInvalidUTF8InBase64Document(t *testing.T) {
+	t.Parallel()
+
+	decoded := append([]byte{0xff, '\n'}, readFixture(t, "shadowsocks.txt")...)
+	document := []byte(base64.StdEncoding.EncodeToString(decoded))
+	result, err := Parse(testSubscriptionID, document)
+	if err == nil {
+		t.Fatal("Parse() returned nil error, want decoded invalid UTF-8 rejection")
+	}
+	if len(result.Endpoints) != 0 {
+		t.Fatalf("len(Endpoints) = %d, want none", len(result.Endpoints))
+	}
+}
+
+func TestParseVMessRejectsInvalidUTF8BeforeJSONDecode(t *testing.T) {
+	t.Parallel()
+
+	decoded := []byte(`{
+		"ps":"VMess`)
+	decoded = append(decoded, 0xff)
+	decoded = append(decoded, []byte(`",
+		"add":"vmess.example.com",
+		"port":"443",
+		"id":"550e8400-e29b-41d4-a716-446655440000",
+		"aid":"0",
+		"scy":"auto",
+		"net":"tcp"
+	}`)...)
+	payload := base64.StdEncoding.EncodeToString(decoded)
+	if _, err := parseVMess("vmess://" + payload); err == nil {
+		t.Fatal("parseVMess() returned nil error, want invalid UTF-8 rejection")
 	}
 }
 
@@ -667,6 +908,22 @@ func TestParseRejectsInvalidSubscriptionIDWithoutLeakingIt(t *testing.T) {
 	}
 }
 
+func FuzzParse(f *testing.F) {
+	f.Add([]byte{})
+	f.Add([]byte("not a subscription"))
+	f.Add([]byte("ss://YWVzLTI1Ni1nY206c2VjcmV0@fuzz.example.com:8388"))
+	f.Add([]byte(`{"outbounds":[]}`))
+	f.Add([]byte{0xff, 0xfe, 0xfd})
+
+	f.Fuzz(func(t *testing.T, document []byte) {
+		const maxFuzzDocumentBytes = 64 << 10
+		if len(document) > maxFuzzDocumentBytes {
+			document = document[:maxFuzzDocumentBytes]
+		}
+		Parse("fuzz-subscription", document)
+	})
+}
+
 func assertTLS(t *testing.T, endpoint domain.Endpoint, serverName string, insecure bool, alpn []string) {
 	t.Helper()
 	if !endpoint.TLS.Enabled || endpoint.TLS.ServerName != serverName || endpoint.TLS.InsecureSkipVerify != insecure || fmt.Sprint(endpoint.TLS.ALPN) != fmt.Sprint(alpn) {
@@ -719,6 +976,10 @@ func endpointByProtocol(t *testing.T, endpoints []domain.Endpoint, protocol doma
 	}
 	t.Fatalf("protocol %q not found", protocol)
 	return domain.Endpoint{}
+}
+
+func testVLESSLink(query string) string {
+	return "vless://550e8400-e29b-41d4-a716-446655440000@vless.example.com:443?" + query
 }
 
 func readFixture(t *testing.T, name string) []byte {

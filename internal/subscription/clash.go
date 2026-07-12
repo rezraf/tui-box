@@ -1,7 +1,9 @@
 package subscription
 
 import (
+	"bytes"
 	"errors"
+	"io"
 	"strconv"
 	"strings"
 
@@ -128,7 +130,12 @@ func (value *yamlMbps) UnmarshalYAML(node *yaml.Node) error {
 
 func parseClash(subscriptionID string, content []byte) (ParseResult, error) {
 	var document clashDocument
-	if err := yaml.Unmarshal(content, &document); err != nil {
+	decoder := yaml.NewDecoder(bytes.NewReader(content))
+	if err := decoder.Decode(&document); err != nil {
+		return ParseResult{}, errMalformedDocument
+	}
+	var trailing yaml.Node
+	if err := decoder.Decode(&trailing); err != io.EOF {
 		return ParseResult{}, errMalformedDocument
 	}
 	if len(document.Proxies) > MaxEntries {

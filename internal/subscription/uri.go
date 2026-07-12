@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/rezraf/tui-box/internal/domain"
 )
@@ -75,21 +76,25 @@ func parseVLESS(entry string) (domain.Endpoint, error) {
 	if _, hasPassword := parsed.User.Password(); hasPassword {
 		return domain.Endpoint{}, errInvalidEntry
 	}
+	query := parsed.Query()
+	if err := validateVLESSQuery(query); err != nil {
+		return domain.Endpoint{}, errInvalidEntry
+	}
 	host, port, err := hostPort(parsed)
 	if err != nil {
 		return domain.Endpoint{}, errInvalidEntry
 	}
-	tls, err := queryTLS(parsed.Query(), false)
+	tls, err := queryTLS(query, false)
 	if err != nil {
 		return domain.Endpoint{}, errInvalidEntry
 	}
-	transport, err := queryTransport(parsed.Query())
+	transport, err := queryTransport(query)
 	if err != nil {
 		return domain.Endpoint{}, errInvalidEntry
 	}
 	options := &domain.VLESSOptions{
-		Flow:           domain.VLESSFlow(firstValue(parsed.Query(), "flow")),
-		PacketEncoding: domain.PacketEncoding(firstValue(parsed.Query(), "packetEncoding", "packet_encoding")),
+		Flow:           domain.VLESSFlow(firstValue(query, "flow")),
+		PacketEncoding: domain.PacketEncoding(firstValue(query, "packetEncoding", "packet_encoding")),
 	}
 	return domain.Endpoint{
 		Name:         parsed.Fragment,
@@ -126,15 +131,14 @@ func parseVMess(entry string) (domain.Endpoint, error) {
 		payload = payload[:fragment]
 	}
 	decoded, ok := decodeBase64([]byte(strings.TrimSpace(payload)))
-	if !ok || len(decoded) > MaxEntryBytes {
+	if !ok || len(decoded) > MaxEntryBytes || !utf8.Valid(decoded) {
+		return domain.Endpoint{}, errInvalidEntry
+	}
+	if err := validateStrictJSON(decoded); err != nil {
 		return domain.Endpoint{}, errInvalidEntry
 	}
 	var link vmessLink
-	decoder := json.NewDecoder(bytes.NewReader(decoded))
-	if err := decoder.Decode(&link); err != nil {
-		return domain.Endpoint{}, errInvalidEntry
-	}
-	if err := requireJSONEOF(decoder); err != nil {
+	if err := json.Unmarshal(decoded, &link); err != nil {
 		return domain.Endpoint{}, errInvalidEntry
 	}
 	port, err := rawInteger(link.Port, false)
@@ -324,19 +328,51 @@ func parseTUIC(entry string) (domain.Endpoint, error) {
 	}, nil
 }
 
+func validateVLESSQuery(query url.Values) error {
+	groups := [][]string{
+		{"encryption"},
+		{"security"},
+		{"tls"},
+		{"insecure", "allowInsecure", "skip-cert-verify"},
+		{"sni", "serverName", "peer"},
+		{"alpn"},
+		{"fp"},
+		{"pbk"},
+		{"sid"},
+		{"type", "network"},
+		{"path"},
+		{"host"},
+		{"serviceName", "service_name", "grpc-service-name"},
+		{"flow"},
+		{"packetEncoding", "packet_encoding"},
+	}
+	for _, group := range groups {
+		count := 0
+		for _, key := range group {
+			count += len(query[key])
+		}
+		if count > 1 {
+			return errInvalidEntry
+		}
+	}
+	return nil
+}
+
 func queryTLS(query url.Values, required bool) (domain.TLSOptions, error) {
 	security := strings.ToLower(firstValue(query, "security"))
 	enabled := required
 	switch security {
-	case "", "none":
+	case "":
+	case "none":
+		enabled = false
 	case "tls", "reality":
 		enabled = true
 	default:
 		return domain.TLSOptions{}, errInvalidEntry
 	}
-	if value := firstValue(query, "tls"); value != "" {
+	if value, present := queryValue(query, "tls"); present {
 		parsed, err := parseBool(value)
-		if err != nil {
+		if err != nil || security != "" && parsed != enabled {
 			return domain.TLSOptions{}, errInvalidEntry
 		}
 		enabled = parsed
@@ -457,22 +493,34 @@ func queryInteger(query url.Values, keys ...string) (int, error) {
 }
 
 func queryBool(query url.Values, fallback bool, keys ...string) (bool, error) {
-	value := firstValue(query, keys...)
-	if value == "" {
+	value, present := queryValue(query, keys...)
+	if !present {
 		return fallback, nil
 	}
 	return parseBool(value)
 }
 
 func parseBool(value string) (bool, error) {
-	switch strings.ToLower(value) {
-	case "1", "true", "yes", "on":
+	switch value {
+	case "true":
 		return true, nil
-	case "0", "false", "no", "off":
+	case "false":
 		return false, nil
 	default:
 		return false, errInvalidEntry
 	}
+}
+
+func queryValue(values url.Values, keys ...string) (string, bool) {
+	for _, key := range keys {
+		if value, present := values[key]; present {
+			if len(value) == 0 {
+				return "", true
+			}
+			return value[0], true
+		}
+	}
+	return "", false
 }
 
 func firstValue(values url.Values, keys ...string) string {

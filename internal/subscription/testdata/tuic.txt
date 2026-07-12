@@ -1,1 +1,1 @@
-tuic://550e8400-e29b-41d4-a716-446655440000:tuic-secret@tuic.example.com:443?sni=tuic-sni.example.com&alpn=h3&congestion_control=bbr&udp_relay_mode=quic&zero_rtt=1#TUIC%20Node
+tuic://550e8400-e29b-41d4-a716-446655440000:tuic-secret@tuic.example.com:443?sni=tuic-sni.example.com&alpn=h3&congestion_control=bbr&udp_relay_mode=quic&zero_rtt=true#TUIC%20Node

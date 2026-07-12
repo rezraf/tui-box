@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -47,6 +46,9 @@ func Parse(subscriptionID string, document []byte) (ParseResult, error) {
 	}
 	if len(document) > MaxDocumentBytes {
 		return ParseResult{}, errDocumentTooLarge
+	}
+	if !utf8.Valid(document) {
+		return ParseResult{}, errMalformedDocument
 	}
 	content := bytes.TrimSpace(document)
 	if len(content) == 0 {
@@ -103,7 +105,12 @@ func addEndpoint(result *ParseResult, endpoint domain.Endpoint, subscriptionID s
 		endpoint.Name = defaultEndpointName(endpoint.Protocol)
 	}
 	normalizeEndpoint(&endpoint)
-	endpoint.ID = endpointID(endpoint)
+	id, err := endpointID(endpoint)
+	if err != nil {
+		result.Warnings = append(result.Warnings, invalidWarning(subscriptionID, entry))
+		return
+	}
+	endpoint.ID = id
 	if err := endpoint.Validate(); err != nil {
 		result.Warnings = append(result.Warnings, invalidWarning(subscriptionID, entry))
 		return
@@ -124,15 +131,6 @@ func normalizeEndpoint(endpoint *domain.Endpoint) {
 
 func normalizeHost(host string) string {
 	return strings.ToLower(strings.TrimSuffix(host, "."))
-}
-
-func endpointID(endpoint domain.Endpoint) string {
-	endpoint.ID = ""
-	endpoint.SubscriptionID = ""
-	endpoint.Name = ""
-	encoded, _ := json.Marshal(endpoint)
-	digest := sha256.Sum256(encoded)
-	return hex.EncodeToString(digest[:])
 }
 
 func defaultEndpointName(protocol domain.Protocol) string {
@@ -216,7 +214,7 @@ func decodeBase64Document(content []byte) ([]byte, bool) {
 		}
 	}
 	decoded, ok := decodeBase64(compact)
-	if !ok || len(bytes.TrimSpace(decoded)) == 0 || len(decoded) > MaxDocumentBytes {
+	if !ok || len(bytes.TrimSpace(decoded)) == 0 || len(decoded) > MaxDocumentBytes || !utf8.Valid(decoded) {
 		return nil, false
 	}
 	return decoded, true

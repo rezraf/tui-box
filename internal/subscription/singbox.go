@@ -1,9 +1,7 @@
 package subscription
 
 import (
-	"bytes"
 	"encoding/json"
-	"io"
 	"strings"
 
 	"github.com/rezraf/tui-box/internal/domain"
@@ -73,12 +71,11 @@ type singBoxObfs struct {
 }
 
 func parseSingBox(subscriptionID string, content []byte) (ParseResult, error) {
-	var document singBoxDocument
-	decoder := json.NewDecoder(bytes.NewReader(content))
-	if err := decoder.Decode(&document); err != nil {
+	if err := validateStrictJSON(content); err != nil {
 		return ParseResult{}, errMalformedDocument
 	}
-	if err := requireJSONEOF(decoder); err != nil {
+	var document singBoxDocument
+	if err := json.Unmarshal(content, &document); err != nil {
 		return ParseResult{}, errMalformedDocument
 	}
 	if len(document.Outbounds) > MaxEntries {
@@ -105,14 +102,6 @@ func parseSingBox(subscriptionID string, content []byte) (ParseResult, error) {
 		addEndpoint(&result, endpoint, subscriptionID, entryNumber, seen)
 	}
 	return result, nil
-}
-
-func requireJSONEOF(decoder *json.Decoder) error {
-	var trailing json.RawMessage
-	if err := decoder.Decode(&trailing); err != io.EOF {
-		return errInvalidEntry
-	}
-	return nil
 }
 
 func (outbound singBoxOutbound) endpoint() (domain.Endpoint, error) {

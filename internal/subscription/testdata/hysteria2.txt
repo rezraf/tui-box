@@ -1,1 +1,1 @@
-hy2://hy-secret@hy2.example.com:8443?sni=hy-sni.example.com&insecure=1&alpn=h3&obfs=salamander&obfs-password=obfs-secret&upmbps=100&downmbps=200#Hysteria%202
+hy2://hy-secret@hy2.example.com:8443?sni=hy-sni.example.com&insecure=true&alpn=h3&obfs=salamander&obfs-password=obfs-secret&upmbps=100&downmbps=200#Hysteria%202
