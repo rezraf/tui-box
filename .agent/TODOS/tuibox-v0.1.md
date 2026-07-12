@@ -4,7 +4,7 @@
   - Verify: `go test ./internal/domain && go vet ./internal/domain`
 - [x] Parse six protocols from URI/Base64, Clash YAML, and sing-box JSON
   - Verify: `go test ./internal/subscription`
-- [ ] Add bounded HTTPS fetching, hybrid secret storage, and atomic state
+- [x] Add bounded HTTPS fetching, hybrid secret storage, and atomic state
   - Verify: `go test ./internal/subscription ./internal/secrets ./internal/state`
 - [ ] Generate typed sing-box configs for both connection modes and three route modes
   - Verify: `go test ./internal/core`
