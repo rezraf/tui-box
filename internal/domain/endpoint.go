@@ -11,6 +11,7 @@ const (
 	MaxIDLength             = 128
 	MaxNameLength           = 256
 	MaxHostLength           = 253
+	MaxUUIDLength           = 36
 	MaxCredentialLength     = 1024
 	MaxMethodLength         = 128
 	MaxTLSFieldLength       = 255
@@ -53,17 +54,21 @@ type TransportOptions struct {
 }
 
 type Endpoint struct {
-	ID             string           `json:"id"`
-	SubscriptionID string           `json:"subscription_id"`
-	Name           string           `json:"name"`
-	Protocol       Protocol         `json:"protocol"`
-	Host           string           `json:"host"`
-	Port           int              `json:"port"`
-	UUID           string           `json:"uuid,omitempty"`
-	Password       string           `json:"password,omitempty"`
-	Method         string           `json:"method,omitempty"`
-	TLS            TLSOptions       `json:"tls"`
-	Transport      TransportOptions `json:"transport"`
+	ID               string            `json:"id"`
+	SubscriptionID   string            `json:"subscription_id"`
+	Name             string            `json:"name"`
+	Protocol         Protocol          `json:"protocol"`
+	Host             string            `json:"host"`
+	Port             int               `json:"port"`
+	UUID             string            `json:"uuid,omitempty"`
+	Password         string            `json:"password,omitempty"`
+	Method           string            `json:"method,omitempty"`
+	TLS              TLSOptions        `json:"tls"`
+	Transport        TransportOptions  `json:"transport"`
+	VLESSOptions     *VLESSOptions     `json:"vless_options,omitempty"`
+	VMessOptions     *VMessOptions     `json:"vmess_options,omitempty"`
+	Hysteria2Options *Hysteria2Options `json:"hysteria2_options,omitempty"`
+	TUICOptions      *TUICOptions      `json:"tuic_options,omitempty"`
 }
 
 func (endpoint Endpoint) Validate() error {
@@ -79,13 +84,16 @@ func (endpoint Endpoint) Validate() error {
 	if endpoint.Port < 1 || endpoint.Port > 65535 {
 		return fmt.Errorf("port must be between 1 and 65535")
 	}
-	if err := endpoint.validateCredentials(); err != nil {
-		return err
-	}
 	if err := endpoint.TLS.validate(); err != nil {
 		return err
 	}
-	return endpoint.Transport.validate()
+	if err := endpoint.Transport.validateFields(); err != nil {
+		return err
+	}
+	if err := endpoint.validateProtocolOptions(); err != nil {
+		return err
+	}
+	return endpoint.validateProtocolCombination()
 }
 
 func (endpoint Endpoint) validateStrings() error {
@@ -98,7 +106,7 @@ func (endpoint Endpoint) validateStrings() error {
 		{name: "ID", value: endpoint.ID, maxBytes: MaxIDLength, required: true},
 		{name: "subscription ID", value: endpoint.SubscriptionID, maxBytes: MaxIDLength, required: true},
 		{name: "name", value: endpoint.Name, maxBytes: MaxNameLength, required: true},
-		{name: "UUID", value: endpoint.UUID, maxBytes: MaxCredentialLength},
+		{name: "UUID", value: endpoint.UUID, maxBytes: MaxUUIDLength},
 		{name: "password", value: endpoint.Password, maxBytes: MaxCredentialLength},
 		{name: "method", value: endpoint.Method, maxBytes: MaxMethodLength},
 	}
@@ -110,22 +118,75 @@ func (endpoint Endpoint) validateStrings() error {
 	return nil
 }
 
-func (endpoint Endpoint) validateCredentials() error {
+func (endpoint Endpoint) validateProtocolCombination() error {
 	switch endpoint.Protocol {
 	case ProtocolVLESS, ProtocolVMess:
-		return validateUUID(endpoint.UUID)
-	case ProtocolTrojan, ProtocolHysteria2:
-		return requireCredential("password", endpoint.Password)
+		if err := validateUUID(endpoint.UUID); err != nil {
+			return err
+		}
+		if err := rejectCredential("password", endpoint.Password); err != nil {
+			return err
+		}
+		if err := rejectCredential("method", endpoint.Method); err != nil {
+			return err
+		}
+		return endpoint.Transport.validate()
+	case ProtocolTrojan:
+		if err := rejectCredential("UUID", endpoint.UUID); err != nil {
+			return err
+		}
+		if err := rejectCredential("method", endpoint.Method); err != nil {
+			return err
+		}
+		if err := requireCredential("password", endpoint.Password); err != nil {
+			return err
+		}
+		if err := requireTLS(endpoint.TLS); err != nil {
+			return err
+		}
+		return endpoint.Transport.validate()
 	case ProtocolShadowsocks:
+		if err := rejectCredential("UUID", endpoint.UUID); err != nil {
+			return err
+		}
 		if err := requireCredential("method", endpoint.Method); err != nil {
 			return err
 		}
-		return requireCredential("password", endpoint.Password)
+		if err := requireCredential("password", endpoint.Password); err != nil {
+			return err
+		}
+		if err := rejectTLS(endpoint.TLS); err != nil {
+			return err
+		}
+		return rejectStreamTransport(endpoint.Transport)
+	case ProtocolHysteria2:
+		if err := rejectCredential("UUID", endpoint.UUID); err != nil {
+			return err
+		}
+		if err := rejectCredential("method", endpoint.Method); err != nil {
+			return err
+		}
+		if err := requireCredential("password", endpoint.Password); err != nil {
+			return err
+		}
+		if err := requireTLS(endpoint.TLS); err != nil {
+			return err
+		}
+		return rejectStreamTransport(endpoint.Transport)
 	case ProtocolTUIC:
 		if err := validateUUID(endpoint.UUID); err != nil {
 			return err
 		}
-		return requireCredential("password", endpoint.Password)
+		if err := rejectCredential("method", endpoint.Method); err != nil {
+			return err
+		}
+		if err := requireCredential("password", endpoint.Password); err != nil {
+			return err
+		}
+		if err := requireTLS(endpoint.TLS); err != nil {
+			return err
+		}
+		return rejectStreamTransport(endpoint.Transport)
 	default:
 		return nil
 	}
@@ -165,10 +226,25 @@ func (options TLSOptions) validate() error {
 
 func (options TransportOptions) validate() error {
 	switch options.Type {
-	case TransportTCP, TransportWebSocket, TransportGRPC, TransportHTTPUpgrade:
+	case TransportTCP:
+		if options.Path != "" || options.Host != "" || options.ServiceName != "" {
+			return fmt.Errorf("TCP transport does not accept path, host, or service name")
+		}
+	case TransportWebSocket, TransportHTTPUpgrade:
+		if options.ServiceName != "" {
+			return fmt.Errorf("%s transport does not accept service name", options.Type)
+		}
+	case TransportGRPC:
+		if options.Path != "" || options.Host != "" {
+			return fmt.Errorf("gRPC transport does not accept path or host")
+		}
 	default:
 		return fmt.Errorf("unsupported transport")
 	}
+	return nil
+}
+
+func (options TransportOptions) validateFields() error {
 	fields := []struct {
 		name  string
 		value string
@@ -183,6 +259,10 @@ func (options TransportOptions) validate() error {
 		}
 	}
 	return nil
+}
+
+func (options TransportOptions) isZero() bool {
+	return options.Type == "" && options.Path == "" && options.Host == "" && options.ServiceName == ""
 }
 
 func validateHost(name, value string) error {
@@ -242,6 +322,34 @@ func isHex(character rune) bool {
 func requireCredential(name, value string) error {
 	if value == "" {
 		return fmt.Errorf("%s is required", name)
+	}
+	return nil
+}
+
+func rejectCredential(name, value string) error {
+	if value != "" {
+		return fmt.Errorf("%s is not applicable to this protocol", name)
+	}
+	return nil
+}
+
+func requireTLS(options TLSOptions) error {
+	if !options.Enabled {
+		return fmt.Errorf("TLS is required for this protocol")
+	}
+	return nil
+}
+
+func rejectTLS(options TLSOptions) error {
+	if options.Enabled {
+		return fmt.Errorf("TLS is not supported for this protocol")
+	}
+	return nil
+}
+
+func rejectStreamTransport(options TransportOptions) error {
+	if !options.isZero() {
+		return fmt.Errorf("stream transport is not supported for this protocol")
 	}
 	return nil
 }

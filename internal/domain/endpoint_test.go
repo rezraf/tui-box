@@ -10,30 +10,69 @@ const validUUID = "550e8400-e29b-41d4-a716-446655440000"
 func TestEndpointValidateAcceptsSupportedProtocols(t *testing.T) {
 	t.Parallel()
 
+	for _, protocol := range []Protocol{
+		ProtocolVLESS,
+		ProtocolVMess,
+		ProtocolTrojan,
+		ProtocolShadowsocks,
+		ProtocolHysteria2,
+		ProtocolTUIC,
+	} {
+		protocol := protocol
+		t.Run(string(protocol), func(t *testing.T) {
+			t.Parallel()
+			endpoint := validEndpointFor(protocol)
+
+			if err := endpoint.Validate(); err != nil {
+				t.Fatalf("Validate() returned an unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestEndpointValidateAcceptsProtocolSpecificOptions(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name      string
 		protocol  Protocol
 		configure func(*Endpoint)
 	}{
-		{name: "vless", protocol: ProtocolVLESS, configure: func(endpoint *Endpoint) { endpoint.UUID = validUUID }},
-		{name: "vmess", protocol: ProtocolVMess, configure: func(endpoint *Endpoint) { endpoint.UUID = validUUID }},
-		{name: "trojan", protocol: ProtocolTrojan, configure: func(endpoint *Endpoint) { endpoint.Password = "secret" }},
-		{name: "shadowsocks", protocol: ProtocolShadowsocks, configure: func(endpoint *Endpoint) {
-			endpoint.Method = "aes-256-gcm"
-			endpoint.Password = "secret"
+		{name: "vless", protocol: ProtocolVLESS, configure: func(endpoint *Endpoint) {
+			endpoint.VLESSOptions = &VLESSOptions{
+				Flow:           VLESSFlowXTLSRPRXVision,
+				PacketEncoding: PacketEncodingXUDP,
+			}
 		}},
-		{name: "hysteria2", protocol: ProtocolHysteria2, configure: func(endpoint *Endpoint) { endpoint.Password = "secret" }},
+		{name: "vmess", protocol: ProtocolVMess, configure: func(endpoint *Endpoint) {
+			endpoint.VMessOptions = &VMessOptions{
+				Security:       VMessSecurityAES128GCM,
+				AlterID:        MaxVMessAlterID,
+				PacketEncoding: PacketEncodingPacketAddr,
+			}
+		}},
+		{name: "hysteria2", protocol: ProtocolHysteria2, configure: func(endpoint *Endpoint) {
+			endpoint.Hysteria2Options = &Hysteria2Options{
+				ObfsType:     Hysteria2ObfsSalamander,
+				ObfsPassword: "obfs-secret",
+				UpMbps:       MaxHysteria2Mbps,
+				DownMbps:     MaxHysteria2Mbps,
+			}
+		}},
 		{name: "tuic", protocol: ProtocolTUIC, configure: func(endpoint *Endpoint) {
-			endpoint.UUID = validUUID
-			endpoint.Password = "secret"
+			endpoint.TUICOptions = &TUICOptions{
+				CongestionControl: TUICCongestionBBR,
+				UDPRelayMode:      TUICUDPRelayQUIC,
+				ZeroRTT:           true,
+			}
 		}},
 	}
 
 	for _, test := range tests {
+		test := test
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			endpoint := validEndpoint()
-			endpoint.Protocol = test.protocol
+			endpoint := validEndpointFor(test.protocol)
 			test.configure(&endpoint)
 
 			if err := endpoint.Validate(); err != nil {
@@ -57,6 +96,7 @@ func TestEndpointValidateAcceptsSupportedTransports(t *testing.T) {
 	}
 
 	for _, test := range tests {
+		test := test
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 			endpoint := validEndpoint()
@@ -99,34 +139,6 @@ func TestEndpointValidateRejectsInvalidEndpoints(t *testing.T) {
 		{name: "port above maximum", mutate: func(endpoint *Endpoint) { endpoint.Port = 65536 }},
 		{name: "vless missing UUID", mutate: func(endpoint *Endpoint) { endpoint.UUID = "" }},
 		{name: "vless malformed UUID", mutate: func(endpoint *Endpoint) { endpoint.UUID = "not-a-uuid" }},
-		{name: "vmess missing UUID", mutate: func(endpoint *Endpoint) {
-			endpoint.Protocol = ProtocolVMess
-			endpoint.UUID = ""
-		}},
-		{name: "trojan missing password", mutate: func(endpoint *Endpoint) {
-			endpoint.Protocol = ProtocolTrojan
-			endpoint.Password = ""
-		}},
-		{name: "shadowsocks missing method", mutate: func(endpoint *Endpoint) {
-			endpoint.Protocol = ProtocolShadowsocks
-			endpoint.Method = ""
-		}},
-		{name: "shadowsocks missing password", mutate: func(endpoint *Endpoint) {
-			endpoint.Protocol = ProtocolShadowsocks
-			endpoint.Password = ""
-		}},
-		{name: "hysteria2 missing password", mutate: func(endpoint *Endpoint) {
-			endpoint.Protocol = ProtocolHysteria2
-			endpoint.Password = ""
-		}},
-		{name: "tuic missing UUID", mutate: func(endpoint *Endpoint) {
-			endpoint.Protocol = ProtocolTUIC
-			endpoint.UUID = ""
-		}},
-		{name: "tuic missing password", mutate: func(endpoint *Endpoint) {
-			endpoint.Protocol = ProtocolTUIC
-			endpoint.Password = ""
-		}},
 		{name: "unsupported transport", mutate: func(endpoint *Endpoint) {
 			endpoint.Transport.Type = TransportType("quic")
 		}},
@@ -144,9 +156,271 @@ func TestEndpointValidateRejectsInvalidEndpoints(t *testing.T) {
 	}
 
 	for _, test := range tests {
+		test := test
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 			endpoint := validEndpoint()
+			test.mutate(&endpoint)
+
+			if err := endpoint.Validate(); err == nil {
+				t.Fatal("Validate() returned nil, want an error")
+			}
+		})
+	}
+}
+
+func TestEndpointValidateRejectsInvalidProtocolCredentials(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		protocol Protocol
+		mutate   func(*Endpoint)
+	}{
+		{name: "vless missing UUID", protocol: ProtocolVLESS, mutate: func(endpoint *Endpoint) { endpoint.UUID = "" }},
+		{name: "vmess missing UUID", protocol: ProtocolVMess, mutate: func(endpoint *Endpoint) { endpoint.UUID = "" }},
+		{name: "trojan missing password", protocol: ProtocolTrojan, mutate: func(endpoint *Endpoint) { endpoint.Password = "" }},
+		{name: "shadowsocks missing method", protocol: ProtocolShadowsocks, mutate: func(endpoint *Endpoint) { endpoint.Method = "" }},
+		{name: "shadowsocks missing password", protocol: ProtocolShadowsocks, mutate: func(endpoint *Endpoint) { endpoint.Password = "" }},
+		{name: "hysteria2 missing password", protocol: ProtocolHysteria2, mutate: func(endpoint *Endpoint) { endpoint.Password = "" }},
+		{name: "tuic missing UUID", protocol: ProtocolTUIC, mutate: func(endpoint *Endpoint) { endpoint.UUID = "" }},
+		{name: "tuic missing password", protocol: ProtocolTUIC, mutate: func(endpoint *Endpoint) { endpoint.Password = "" }},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			endpoint := validEndpointFor(test.protocol)
+			test.mutate(&endpoint)
+
+			if err := endpoint.Validate(); err == nil {
+				t.Fatal("Validate() returned nil, want an error")
+			}
+		})
+	}
+}
+
+func TestEndpointValidateRejectsIncompatibleExtraCredentials(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		protocol Protocol
+		mutate   func(*Endpoint)
+	}{
+		{name: "vless password", protocol: ProtocolVLESS, mutate: func(endpoint *Endpoint) { endpoint.Password = "extra" }},
+		{name: "vless method", protocol: ProtocolVLESS, mutate: func(endpoint *Endpoint) { endpoint.Method = "extra" }},
+		{name: "vmess password", protocol: ProtocolVMess, mutate: func(endpoint *Endpoint) { endpoint.Password = "extra" }},
+		{name: "vmess method", protocol: ProtocolVMess, mutate: func(endpoint *Endpoint) { endpoint.Method = "extra" }},
+		{name: "trojan UUID", protocol: ProtocolTrojan, mutate: func(endpoint *Endpoint) { endpoint.UUID = validUUID }},
+		{name: "trojan method", protocol: ProtocolTrojan, mutate: func(endpoint *Endpoint) { endpoint.Method = "extra" }},
+		{name: "shadowsocks UUID", protocol: ProtocolShadowsocks, mutate: func(endpoint *Endpoint) { endpoint.UUID = validUUID }},
+		{name: "hysteria2 UUID", protocol: ProtocolHysteria2, mutate: func(endpoint *Endpoint) { endpoint.UUID = validUUID }},
+		{name: "hysteria2 method", protocol: ProtocolHysteria2, mutate: func(endpoint *Endpoint) { endpoint.Method = "extra" }},
+		{name: "tuic method", protocol: ProtocolTUIC, mutate: func(endpoint *Endpoint) { endpoint.Method = "extra" }},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			endpoint := validEndpointFor(test.protocol)
+			test.mutate(&endpoint)
+
+			if err := endpoint.Validate(); err == nil {
+				t.Fatal("Validate() returned nil, want an error")
+			}
+		})
+	}
+}
+
+func TestEndpointValidateRejectsMismatchedProtocolOptions(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		protocol Protocol
+		mutate   func(*Endpoint)
+	}{
+		{name: "vless with vmess options", protocol: ProtocolVLESS, mutate: func(endpoint *Endpoint) {
+			endpoint.VMessOptions = &VMessOptions{}
+		}},
+		{name: "vmess with vless options", protocol: ProtocolVMess, mutate: func(endpoint *Endpoint) {
+			endpoint.VLESSOptions = &VLESSOptions{}
+		}},
+		{name: "trojan with vless options", protocol: ProtocolTrojan, mutate: func(endpoint *Endpoint) {
+			endpoint.VLESSOptions = &VLESSOptions{}
+		}},
+		{name: "shadowsocks with hysteria2 options", protocol: ProtocolShadowsocks, mutate: func(endpoint *Endpoint) {
+			endpoint.Hysteria2Options = &Hysteria2Options{}
+		}},
+		{name: "hysteria2 with tuic options", protocol: ProtocolHysteria2, mutate: func(endpoint *Endpoint) {
+			endpoint.TUICOptions = &TUICOptions{}
+		}},
+		{name: "tuic with hysteria2 options", protocol: ProtocolTUIC, mutate: func(endpoint *Endpoint) {
+			endpoint.Hysteria2Options = &Hysteria2Options{}
+		}},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			endpoint := validEndpointFor(test.protocol)
+			test.mutate(&endpoint)
+
+			if err := endpoint.Validate(); err == nil {
+				t.Fatal("Validate() returned nil, want an error")
+			}
+		})
+	}
+}
+
+func TestEndpointValidateEnforcesProtocolTLSAndTransportCombinations(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		protocol Protocol
+		mutate   func(*Endpoint)
+	}{
+		{name: "vless requires stream transport", protocol: ProtocolVLESS, mutate: func(endpoint *Endpoint) {
+			endpoint.Transport = TransportOptions{}
+		}},
+		{name: "vmess requires stream transport", protocol: ProtocolVMess, mutate: func(endpoint *Endpoint) {
+			endpoint.Transport = TransportOptions{}
+		}},
+		{name: "trojan requires TLS", protocol: ProtocolTrojan, mutate: func(endpoint *Endpoint) {
+			endpoint.TLS = TLSOptions{}
+		}},
+		{name: "trojan requires stream transport", protocol: ProtocolTrojan, mutate: func(endpoint *Endpoint) {
+			endpoint.Transport = TransportOptions{}
+		}},
+		{name: "shadowsocks rejects TLS", protocol: ProtocolShadowsocks, mutate: func(endpoint *Endpoint) {
+			endpoint.TLS.Enabled = true
+		}},
+		{name: "shadowsocks rejects stream transport", protocol: ProtocolShadowsocks, mutate: func(endpoint *Endpoint) {
+			endpoint.Transport = TransportOptions{Type: TransportTCP}
+		}},
+		{name: "hysteria2 requires TLS", protocol: ProtocolHysteria2, mutate: func(endpoint *Endpoint) {
+			endpoint.TLS = TLSOptions{}
+		}},
+		{name: "hysteria2 rejects stream transport", protocol: ProtocolHysteria2, mutate: func(endpoint *Endpoint) {
+			endpoint.Transport = TransportOptions{Type: TransportTCP}
+		}},
+		{name: "tuic requires TLS", protocol: ProtocolTUIC, mutate: func(endpoint *Endpoint) {
+			endpoint.TLS = TLSOptions{}
+		}},
+		{name: "tuic rejects stream transport", protocol: ProtocolTUIC, mutate: func(endpoint *Endpoint) {
+			endpoint.Transport = TransportOptions{Type: TransportTCP}
+		}},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			endpoint := validEndpointFor(test.protocol)
+			test.mutate(&endpoint)
+
+			if err := endpoint.Validate(); err == nil {
+				t.Fatal("Validate() returned nil, want an error")
+			}
+		})
+	}
+}
+
+func TestEndpointValidateRejectsInvalidTransportFieldCombinations(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		transport TransportOptions
+	}{
+		{name: "tcp path", transport: TransportOptions{Type: TransportTCP, Path: "/proxy"}},
+		{name: "tcp host", transport: TransportOptions{Type: TransportTCP, Host: "cdn.example.com"}},
+		{name: "tcp service name", transport: TransportOptions{Type: TransportTCP, ServiceName: "proxy.Service"}},
+		{name: "websocket service name", transport: TransportOptions{Type: TransportWebSocket, ServiceName: "proxy.Service"}},
+		{name: "http upgrade service name", transport: TransportOptions{Type: TransportHTTPUpgrade, ServiceName: "proxy.Service"}},
+		{name: "grpc path", transport: TransportOptions{Type: TransportGRPC, Path: "/proxy"}},
+		{name: "grpc host", transport: TransportOptions{Type: TransportGRPC, Host: "cdn.example.com"}},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			endpoint := validEndpoint()
+			endpoint.Transport = test.transport
+
+			if err := endpoint.Validate(); err == nil {
+				t.Fatal("Validate() returned nil, want an error")
+			}
+		})
+	}
+}
+
+func TestEndpointValidateRejectsInvalidProtocolOptions(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		protocol Protocol
+		mutate   func(*Endpoint)
+	}{
+		{name: "unsupported vless flow", protocol: ProtocolVLESS, mutate: func(endpoint *Endpoint) {
+			endpoint.VLESSOptions = &VLESSOptions{Flow: VLESSFlow("unsupported")}
+		}},
+		{name: "unsupported vless packet encoding", protocol: ProtocolVLESS, mutate: func(endpoint *Endpoint) {
+			endpoint.VLESSOptions = &VLESSOptions{PacketEncoding: PacketEncoding("unsupported")}
+		}},
+		{name: "unsupported vmess security", protocol: ProtocolVMess, mutate: func(endpoint *Endpoint) {
+			endpoint.VMessOptions = &VMessOptions{Security: VMessSecurity("unsupported")}
+		}},
+		{name: "negative vmess alter ID", protocol: ProtocolVMess, mutate: func(endpoint *Endpoint) {
+			endpoint.VMessOptions = &VMessOptions{AlterID: -1}
+		}},
+		{name: "vmess alter ID above maximum", protocol: ProtocolVMess, mutate: func(endpoint *Endpoint) {
+			endpoint.VMessOptions = &VMessOptions{AlterID: MaxVMessAlterID + 1}
+		}},
+		{name: "unsupported vmess packet encoding", protocol: ProtocolVMess, mutate: func(endpoint *Endpoint) {
+			endpoint.VMessOptions = &VMessOptions{PacketEncoding: PacketEncoding("unsupported")}
+		}},
+		{name: "unsupported hysteria2 obfs type", protocol: ProtocolHysteria2, mutate: func(endpoint *Endpoint) {
+			endpoint.Hysteria2Options = &Hysteria2Options{ObfsType: Hysteria2ObfsType("unsupported")}
+		}},
+		{name: "hysteria2 obfs password without type", protocol: ProtocolHysteria2, mutate: func(endpoint *Endpoint) {
+			endpoint.Hysteria2Options = &Hysteria2Options{ObfsPassword: "secret"}
+		}},
+		{name: "hysteria2 obfs type without password", protocol: ProtocolHysteria2, mutate: func(endpoint *Endpoint) {
+			endpoint.Hysteria2Options = &Hysteria2Options{ObfsType: Hysteria2ObfsSalamander}
+		}},
+		{name: "negative hysteria2 upload", protocol: ProtocolHysteria2, mutate: func(endpoint *Endpoint) {
+			endpoint.Hysteria2Options = &Hysteria2Options{UpMbps: -1}
+		}},
+		{name: "hysteria2 upload above maximum", protocol: ProtocolHysteria2, mutate: func(endpoint *Endpoint) {
+			endpoint.Hysteria2Options = &Hysteria2Options{UpMbps: MaxHysteria2Mbps + 1}
+		}},
+		{name: "negative hysteria2 download", protocol: ProtocolHysteria2, mutate: func(endpoint *Endpoint) {
+			endpoint.Hysteria2Options = &Hysteria2Options{DownMbps: -1}
+		}},
+		{name: "hysteria2 download above maximum", protocol: ProtocolHysteria2, mutate: func(endpoint *Endpoint) {
+			endpoint.Hysteria2Options = &Hysteria2Options{DownMbps: MaxHysteria2Mbps + 1}
+		}},
+		{name: "unsupported tuic congestion control", protocol: ProtocolTUIC, mutate: func(endpoint *Endpoint) {
+			endpoint.TUICOptions = &TUICOptions{CongestionControl: TUICCongestionControl("unsupported")}
+		}},
+		{name: "unsupported tuic UDP relay mode", protocol: ProtocolTUIC, mutate: func(endpoint *Endpoint) {
+			endpoint.TUICOptions = &TUICOptions{UDPRelayMode: TUICUDPRelayMode("unsupported")}
+		}},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			endpoint := validEndpointFor(test.protocol)
 			test.mutate(&endpoint)
 
 			if err := endpoint.Validate(); err == nil {
@@ -172,9 +446,13 @@ func TestEndpointValidateRejectsControlCharacters(t *testing.T) {
 		{name: "transport path", mutate: func(endpoint *Endpoint) {
 			endpoint.Transport = TransportOptions{Type: TransportWebSocket, Path: "/proxy\tunsafe"}
 		}},
+		{name: "protocol option", mutate: func(endpoint *Endpoint) {
+			endpoint.VLESSOptions = &VLESSOptions{Flow: VLESSFlow("unsafe\n")}
+		}},
 	}
 
 	for _, test := range tests {
+		test := test
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 			endpoint := validEndpoint()
@@ -191,42 +469,139 @@ func TestEndpointValidateRejectsOversizedFields(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name   string
-		mutate func(*Endpoint)
+		name     string
+		protocol Protocol
+		mutate   func(*Endpoint)
 	}{
-		{name: "name", mutate: func(endpoint *Endpoint) { endpoint.Name = strings.Repeat("a", MaxNameLength+1) }},
-		{name: "host", mutate: func(endpoint *Endpoint) { endpoint.Host = strings.Repeat("a", MaxHostLength+1) }},
-		{name: "credential", mutate: func(endpoint *Endpoint) {
-			endpoint.Protocol = ProtocolTrojan
+		{name: "ID", protocol: ProtocolVLESS, mutate: func(endpoint *Endpoint) {
+			endpoint.ID = strings.Repeat("a", MaxIDLength+1)
+		}},
+		{name: "subscription ID", protocol: ProtocolVLESS, mutate: func(endpoint *Endpoint) {
+			endpoint.SubscriptionID = strings.Repeat("a", MaxIDLength+1)
+		}},
+		{name: "name", protocol: ProtocolVLESS, mutate: func(endpoint *Endpoint) {
+			endpoint.Name = strings.Repeat("a", MaxNameLength+1)
+		}},
+		{name: "host", protocol: ProtocolVLESS, mutate: func(endpoint *Endpoint) {
+			endpoint.Host = strings.Repeat("a", MaxHostLength+1)
+		}},
+		{name: "UUID", protocol: ProtocolVLESS, mutate: func(endpoint *Endpoint) {
+			endpoint.UUID = strings.Repeat("a", MaxUUIDLength+1)
+		}},
+		{name: "password", protocol: ProtocolTrojan, mutate: func(endpoint *Endpoint) {
 			endpoint.Password = strings.Repeat("a", MaxCredentialLength+1)
 		}},
-		{name: "transport path", mutate: func(endpoint *Endpoint) {
-			endpoint.Transport = TransportOptions{Type: TransportWebSocket, Path: "/" + strings.Repeat("a", MaxTransportFieldLength)}
+		{name: "method", protocol: ProtocolShadowsocks, mutate: func(endpoint *Endpoint) {
+			endpoint.Method = strings.Repeat("a", MaxMethodLength+1)
+		}},
+		{name: "TLS server name", protocol: ProtocolVLESS, mutate: func(endpoint *Endpoint) {
+			endpoint.TLS.Enabled = true
+			endpoint.TLS.ServerName = strings.Repeat("a", MaxHostLength+1)
+		}},
+		{name: "TLS ALPN count", protocol: ProtocolVLESS, mutate: func(endpoint *Endpoint) {
+			endpoint.TLS.Enabled = true
+			endpoint.TLS.ALPN = make([]string, MaxALPNValues+1)
+			for index := range endpoint.TLS.ALPN {
+				endpoint.TLS.ALPN[index] = "h2"
+			}
+		}},
+		{name: "TLS ALPN value", protocol: ProtocolVLESS, mutate: func(endpoint *Endpoint) {
+			endpoint.TLS.Enabled = true
+			endpoint.TLS.ALPN = []string{strings.Repeat("a", MaxTLSFieldLength+1)}
+		}},
+		{name: "transport path", protocol: ProtocolVLESS, mutate: func(endpoint *Endpoint) {
+			endpoint.Transport = TransportOptions{Type: TransportWebSocket, Path: strings.Repeat("a", MaxTransportFieldLength+1)}
+		}},
+		{name: "transport host", protocol: ProtocolVLESS, mutate: func(endpoint *Endpoint) {
+			endpoint.Transport = TransportOptions{Type: TransportWebSocket, Host: strings.Repeat("a", MaxTransportFieldLength+1)}
+		}},
+		{name: "transport service name", protocol: ProtocolVLESS, mutate: func(endpoint *Endpoint) {
+			endpoint.Transport = TransportOptions{Type: TransportGRPC, ServiceName: strings.Repeat("a", MaxTransportFieldLength+1)}
+		}},
+		{name: "vless flow", protocol: ProtocolVLESS, mutate: func(endpoint *Endpoint) {
+			endpoint.VLESSOptions = &VLESSOptions{Flow: VLESSFlow(strings.Repeat("a", MaxProtocolOptionLength+1))}
+		}},
+		{name: "vless packet encoding", protocol: ProtocolVLESS, mutate: func(endpoint *Endpoint) {
+			endpoint.VLESSOptions = &VLESSOptions{PacketEncoding: PacketEncoding(strings.Repeat("a", MaxProtocolOptionLength+1))}
+		}},
+		{name: "vmess security", protocol: ProtocolVMess, mutate: func(endpoint *Endpoint) {
+			endpoint.VMessOptions = &VMessOptions{Security: VMessSecurity(strings.Repeat("a", MaxProtocolOptionLength+1))}
+		}},
+		{name: "vmess packet encoding", protocol: ProtocolVMess, mutate: func(endpoint *Endpoint) {
+			endpoint.VMessOptions = &VMessOptions{PacketEncoding: PacketEncoding(strings.Repeat("a", MaxProtocolOptionLength+1))}
+		}},
+		{name: "hysteria2 obfs type", protocol: ProtocolHysteria2, mutate: func(endpoint *Endpoint) {
+			endpoint.Hysteria2Options = &Hysteria2Options{ObfsType: Hysteria2ObfsType(strings.Repeat("a", MaxProtocolOptionLength+1))}
+		}},
+		{name: "hysteria2 obfs password", protocol: ProtocolHysteria2, mutate: func(endpoint *Endpoint) {
+			endpoint.Hysteria2Options = &Hysteria2Options{
+				ObfsType:     Hysteria2ObfsSalamander,
+				ObfsPassword: strings.Repeat("a", MaxCredentialLength+1),
+			}
+		}},
+		{name: "tuic congestion control", protocol: ProtocolTUIC, mutate: func(endpoint *Endpoint) {
+			endpoint.TUICOptions = &TUICOptions{CongestionControl: TUICCongestionControl(strings.Repeat("a", MaxProtocolOptionLength+1))}
+		}},
+		{name: "tuic UDP relay mode", protocol: ProtocolTUIC, mutate: func(endpoint *Endpoint) {
+			endpoint.TUICOptions = &TUICOptions{UDPRelayMode: TUICUDPRelayMode(strings.Repeat("a", MaxProtocolOptionLength+1))}
 		}},
 	}
 
 	for _, test := range tests {
+		test := test
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			endpoint := validEndpoint()
+			endpoint := validEndpointFor(test.protocol)
 			test.mutate(&endpoint)
 
-			if err := endpoint.Validate(); err == nil {
+			err := endpoint.Validate()
+			if err == nil {
 				t.Fatal("Validate() returned nil, want an error")
+			}
+			want := "exceeds"
+			if test.name == "TLS ALPN count" {
+				want = "too many"
+			}
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("Validate() error = %q, want it to contain %q", err, want)
 			}
 		})
 	}
 }
 
 func validEndpoint() Endpoint {
-	return Endpoint{
+	return validEndpointFor(ProtocolVLESS)
+}
+
+func validEndpointFor(protocol Protocol) Endpoint {
+	endpoint := Endpoint{
 		ID:             "endpoint-1",
 		SubscriptionID: "subscription-1",
 		Name:           "Example endpoint",
-		Protocol:       ProtocolVLESS,
+		Protocol:       protocol,
 		Host:           "server.example.com",
 		Port:           443,
-		UUID:           validUUID,
-		Transport:      TransportOptions{Type: TransportTCP},
 	}
+
+	switch protocol {
+	case ProtocolVLESS, ProtocolVMess:
+		endpoint.UUID = validUUID
+		endpoint.Transport = TransportOptions{Type: TransportTCP}
+	case ProtocolTrojan:
+		endpoint.Password = "secret"
+		endpoint.TLS.Enabled = true
+		endpoint.Transport = TransportOptions{Type: TransportTCP}
+	case ProtocolShadowsocks:
+		endpoint.Method = "aes-256-gcm"
+		endpoint.Password = "secret"
+	case ProtocolHysteria2:
+		endpoint.Password = "secret"
+		endpoint.TLS.Enabled = true
+	case ProtocolTUIC:
+		endpoint.UUID = validUUID
+		endpoint.Password = "secret"
+		endpoint.TLS.Enabled = true
+	}
+
+	return endpoint
 }
