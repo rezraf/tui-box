@@ -7,9 +7,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestFileStoreUsesRestrictedPermissionsAndPersistsValues(t *testing.T) {
@@ -20,6 +23,7 @@ func TestFileStoreUsesRestrictedPermissionsAndPersistsValues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newFileStore() returned an unexpected error: %v", err)
 	}
+	defer store.Close()
 	if err := store.Set(context.Background(), "subscription-1", "https://example.com/one"); err != nil {
 		t.Fatalf("Set() returned an unexpected error: %v", err)
 	}
@@ -33,6 +37,7 @@ func TestFileStoreUsesRestrictedPermissionsAndPersistsValues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen returned an unexpected error: %v", err)
 	}
+	defer reopened.Close()
 	value, err := reopened.Get(context.Background(), "subscription-1")
 	if err != nil {
 		t.Fatalf("Get() returned an unexpected error: %v", err)
@@ -50,6 +55,7 @@ func TestFileStoreAtomicallyReplacesAndDeletesValues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newFileStore() returned an unexpected error: %v", err)
 	}
+	defer store.Close()
 	ctx := context.Background()
 	if err := store.Set(ctx, "subscription-1", "https://example.com/old"); err != nil {
 		t.Fatalf("first Set() returned an unexpected error: %v", err)
@@ -121,10 +127,12 @@ func TestIndependentFileStoresDoNotLoseConcurrentUpdates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first newFileStore() returned an unexpected error: %v", err)
 	}
+	defer first.Close()
 	second, err := newFileStore(directory)
 	if err != nil {
 		t.Fatalf("second newFileStore() returned an unexpected error: %v", err)
 	}
+	defer second.Close()
 
 	base := make(map[string]string, 500)
 	for index := 0; index < 500; index++ {
@@ -181,6 +189,7 @@ func TestFileStoreEnforcesPerSecretSizeBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newFileStore() returned an unexpected error: %v", err)
 	}
+	defer store.Close()
 	atLimit := strings.Repeat("x", maxSecretBytes)
 	if err := store.Set(context.Background(), "at-limit", atLimit); err != nil {
 		t.Fatalf("Set() rejected %d-byte secret: %v", maxSecretBytes, err)
@@ -206,6 +215,7 @@ func TestFileStoreRejectsSecretThatCannotRoundTripThroughJSON(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newFileStore() returned an unexpected error: %v", err)
 	}
+	defer store.Close()
 	if err := store.Set(context.Background(), "invalid", string([]byte{0xff})); err == nil {
 		t.Fatal("Set() accepted invalid UTF-8 secret")
 	}
@@ -229,6 +239,7 @@ func TestFileStoreEnforcesEncodedFileSizeBoundaryBeforeWrite(t *testing.T) {
 			if err != nil {
 				t.Fatalf("newFileStore() returned an unexpected error: %v", err)
 			}
+			defer store.Close()
 			values, target := fallbackValuesForEncodedSize(t, test.targetSize, "boundary")
 			encoded, err := json.Marshal(values)
 			if err != nil {
@@ -286,6 +297,7 @@ func TestFileStoreOperationsRemainAnchoredAfterDirectoryPathReplacement(t *testi
 	if err != nil {
 		t.Fatalf("newFileStore() returned an unexpected error: %v", err)
 	}
+	defer store.Close()
 	moved := filepath.Join(base, "moved")
 	if err := os.Rename(directory, moved); err != nil {
 		t.Fatalf("Rename() secret directory: %v", err)
@@ -313,6 +325,7 @@ func TestFileStorePreservesCanceledContextIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newFileStore() returned an unexpected error: %v", err)
 	}
+	defer store.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if err := store.Set(ctx, "subscription-1", "secret"); !errors.Is(err, context.Canceled) {
@@ -353,6 +366,7 @@ func TestFileStoreErrorsDoNotLeakStoredSecrets(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newFileStore() returned an unexpected error: %v", err)
 	}
+	defer store.Close()
 	_, err = store.Get(context.Background(), "subscription-1")
 	if err == nil {
 		t.Fatal("Get() returned nil error for malformed file")
@@ -362,6 +376,65 @@ func TestFileStoreErrorsDoNotLeakStoredSecrets(t *testing.T) {
 			t.Fatalf("file error leaked %q: %v", sensitive, err)
 		}
 	}
+}
+
+func TestFileStoreCloseIsIdempotentAndOperationsReturnStableError(t *testing.T) {
+	store, err := newFileStore(filepath.Join(t.TempDir(), "secrets"))
+	if err != nil {
+		t.Fatalf("newFileStore() returned an unexpected error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close() returned an unexpected error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("second Close() returned an unexpected error: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	operations := []struct {
+		name string
+		run  func() error
+	}{
+		{name: "Get", run: func() error { _, err := store.Get(ctx, "invalid key"); return err }},
+		{name: "Set", run: func() error { return store.Set(ctx, "invalid key", "secret") }},
+		{name: "Delete", run: func() error { return store.Delete(ctx, "invalid key") }},
+	}
+	for _, operation := range operations {
+		if err := operation.run(); err != ErrSecretStoreClosed {
+			t.Errorf("%s() error = %v, want stable ErrSecretStoreClosed", operation.name, err)
+		}
+	}
+}
+
+func TestFileStoreRepeatedConstructionAndCloseDoesNotLeakDescriptors(t *testing.T) {
+	directory := filepath.Join(t.TempDir(), "secrets")
+	runtime.GC()
+	before := secretsOpenDescriptorCount()
+	for range 100 {
+		store, err := newFileStore(directory)
+		if err != nil {
+			t.Fatalf("newFileStore() returned an unexpected error: %v", err)
+		}
+		if err := store.Close(); err != nil {
+			t.Fatalf("Close() returned an unexpected error: %v", err)
+		}
+	}
+	runtime.GC()
+	after := secretsOpenDescriptorCount()
+	if after > before+2 {
+		t.Fatalf("open descriptors grew from %d to %d after repeated construction and close", before, after)
+	}
+}
+
+func secretsOpenDescriptorCount() int {
+	count := 0
+	for descriptor := 0; descriptor < 1024; descriptor++ {
+		if _, err := unix.FcntlInt(uintptr(descriptor), unix.F_GETFD, 0); err == nil {
+			count++
+		}
+	}
+	return count
 }
 
 func fallbackValuesForEncodedSize(t *testing.T, targetSize int, targetKey string) (map[string]string, string) {

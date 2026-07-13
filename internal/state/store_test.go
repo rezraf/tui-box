@@ -1,6 +1,7 @@
 package state
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,8 +12,11 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/rezraf/tui-box/internal/domain"
+	"github.com/rezraf/tui-box/internal/filelock"
+	"golang.org/x/sys/unix"
 )
 
 func TestStoreUsesExplicitSchemaAndRestrictedPermissions(t *testing.T) {
@@ -23,6 +27,7 @@ func TestStoreUsesExplicitSchemaAndRestrictedPermissions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore() returned an unexpected error: %v", err)
 	}
+	defer store.Close()
 	empty, err := store.Load()
 	if err != nil {
 		t.Fatalf("Load() empty store returned an unexpected error: %v", err)
@@ -70,6 +75,7 @@ func TestStoreAtomicallyReplacesStateFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore() returned an unexpected error: %v", err)
 	}
+	defer store.Close()
 	first := testSnapshot()
 	if err := store.Save(first); err != nil {
 		t.Fatalf("first Save() returned an unexpected error: %v", err)
@@ -151,6 +157,7 @@ func TestStoreStrictlyRejectsMalformedState(t *testing.T) {
 			if err != nil {
 				t.Fatalf("NewStore() returned an unexpected error: %v", err)
 			}
+			defer store.Close()
 			if err := os.WriteFile(filepath.Join(directory, StateFileName), test.content, 0o600); err != nil {
 				t.Fatalf("WriteFile(): %v", err)
 			}
@@ -253,9 +260,11 @@ func TestStoreAllowsMacOSTemporaryDirectoryAlias(t *testing.T) {
 	if temporaryRoot == resolvedRoot {
 		t.Skip("temporary directory does not traverse the /var system alias")
 	}
-	if _, err := NewStore(filepath.Join(temporaryRoot, "nested", "state")); err != nil {
+	store, err := NewStore(filepath.Join(temporaryRoot, "nested", "state"))
+	if err != nil {
 		t.Fatalf("NewStore() rejected trusted macOS temporary-directory alias: %v", err)
 	}
+	defer store.Close()
 }
 
 func TestCommitSubscriptionRefreshPreservesLastKnownGoodCache(t *testing.T) {
@@ -266,6 +275,7 @@ func TestCommitSubscriptionRefreshPreservesLastKnownGoodCache(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore() returned an unexpected error: %v", err)
 	}
+	defer store.Close()
 	original := testSnapshot()
 	if err := store.Save(original); err != nil {
 		t.Fatalf("Save() returned an unexpected error: %v", err)
@@ -311,6 +321,7 @@ func TestCommitSubscriptionRefreshReplacesOnlyTargetSubscriptionTransactionally(
 	if err != nil {
 		t.Fatalf("NewStore() returned an unexpected error: %v", err)
 	}
+	defer store.Close()
 	original := testSnapshot()
 	if err := store.Save(original); err != nil {
 		t.Fatalf("Save() returned an unexpected error: %v", err)
@@ -357,6 +368,7 @@ func TestStoreRejectsEncodedStateAboveLoadLimitBeforeWrite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore() returned an unexpected error: %v", err)
 	}
+	defer store.Close()
 	original := testSnapshot()
 	if err := store.Save(original); err != nil {
 		t.Fatalf("initial Save() returned an unexpected error: %v", err)
@@ -403,6 +415,7 @@ func TestStoreEnforcesSubscriptionCountBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore() returned an unexpected error: %v", err)
 	}
+	defer store.Close()
 	atLimit := Snapshot{SchemaVersion: CurrentSchemaVersion, Subscriptions: testSubscriptions(MaxStateSubscriptions)}
 	if err := store.Save(atLimit); err != nil {
 		t.Fatalf("Save() rejected %d subscriptions: %v", MaxStateSubscriptions, err)
@@ -426,6 +439,7 @@ func TestStoreEnforcesEndpointCountBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore() returned an unexpected error: %v", err)
 	}
+	defer store.Close()
 	subscription := domain.Subscription{ID: "subscription-a", Name: "Subscription A", SecretRef: "secret-a", Format: domain.SubscriptionFormatURIList}
 	atLimit := Snapshot{
 		SchemaVersion: CurrentSchemaVersion,
@@ -459,10 +473,12 @@ func TestStaleSaveConflictsAndUpdatePreservesBothChanges(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first NewStore() returned an unexpected error: %v", err)
 	}
+	defer first.Close()
 	second, err := NewStore(directory)
 	if err != nil {
 		t.Fatalf("second NewStore() returned an unexpected error: %v", err)
 	}
+	defer second.Close()
 	if err := first.Save(testSnapshot()); err != nil {
 		t.Fatalf("initial Save() returned an unexpected error: %v", err)
 	}
@@ -508,6 +524,7 @@ func TestUpdateRejectsRevisionMutation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore() returned an unexpected error: %v", err)
 	}
+	defer store.Close()
 	if err := store.Save(testSnapshot()); err != nil {
 		t.Fatalf("initial Save() returned an unexpected error: %v", err)
 	}
@@ -533,6 +550,7 @@ func TestStoreOperationsRemainAnchoredAfterDirectoryPathReplacement(t *testing.T
 	if err != nil {
 		t.Fatalf("NewStore() returned an unexpected error: %v", err)
 	}
+	defer store.Close()
 
 	moved := filepath.Join(base, "moved")
 	if err := os.Rename(directory, moved); err != nil {
@@ -562,10 +580,12 @@ func TestIndependentStoresDoNotLoseConcurrentRefreshes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first NewStore() returned an unexpected error: %v", err)
 	}
+	defer first.Close()
 	second, err := NewStore(directory)
 	if err != nil {
 		t.Fatalf("second NewStore() returned an unexpected error: %v", err)
 	}
+	defer second.Close()
 
 	original := Snapshot{
 		SchemaVersion: CurrentSchemaVersion,
@@ -646,6 +666,7 @@ func TestStoreSupportsConcurrentAccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore() returned an unexpected error: %v", err)
 	}
+	defer store.Close()
 	initial := testSnapshot()
 	if err := store.Save(initial); err != nil {
 		t.Fatalf("Save() returned an unexpected error: %v", err)
@@ -694,6 +715,166 @@ func TestStoreSupportsConcurrentAccess(t *testing.T) {
 	if len(got.Endpoints) != 2 {
 		t.Fatalf("len(final Endpoints) = %d, want one A and one preserved B", len(got.Endpoints))
 	}
+}
+
+func TestStoreContextMethodsPropagateLockDeadline(t *testing.T) {
+	store, err := NewStore(filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatalf("NewStore() returned an unexpected error: %v", err)
+	}
+	defer store.Close()
+	if err := store.Save(testSnapshot()); err != nil {
+		t.Fatalf("Save() returned an unexpected error: %v", err)
+	}
+
+	lock, err := filelock.Acquire(context.Background(), store.root, StateLockFileName)
+	if err != nil {
+		t.Fatalf("Acquire() state lock: %v", err)
+	}
+	defer lock.Close()
+
+	operations := []struct {
+		name string
+		run  func(context.Context) error
+	}{
+		{name: "LoadContext", run: func(ctx context.Context) error { _, err := store.LoadContext(ctx); return err }},
+		{name: "SaveContext", run: func(ctx context.Context) error { return store.SaveContext(ctx, testSnapshot()) }},
+		{name: "UpdateContext", run: func(ctx context.Context) error { return store.UpdateContext(ctx, func(*Snapshot) error { return nil }) }},
+		{name: "CommitSubscriptionRefreshContext", run: func(ctx context.Context) error {
+			_, err := store.CommitSubscriptionRefreshContext(ctx, "subscription-a", []domain.Endpoint{testEndpoint("new-a", "subscription-a", "new-a.example.com")}, nil)
+			return err
+		}},
+	}
+	for _, operation := range operations {
+		t.Run(operation.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+			defer cancel()
+			if err := operation.run(ctx); !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("%s() error = %v, want context.DeadlineExceeded", operation.name, err)
+			}
+		})
+	}
+}
+
+func TestStoreConvenienceContextHasBoundedDeadline(t *testing.T) {
+	if defaultOperationTimeout <= 0 || defaultOperationTimeout > 5*time.Second {
+		t.Fatalf("default operation timeout = %v, want a positive bound no longer than 5s", defaultOperationTimeout)
+	}
+	started := time.Now()
+	ctx, cancel := defaultOperationContext()
+	defer cancel()
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		t.Fatal("default operation context has no deadline")
+	}
+	if deadline.Before(started) || deadline.After(started.Add(defaultOperationTimeout+time.Second)) {
+		t.Fatalf("default operation deadline = %v, want a %v bound", deadline, defaultOperationTimeout)
+	}
+}
+
+func TestStoreCloseWaitsForInFlightOperationAndIsIdempotent(t *testing.T) {
+	store, err := NewStore(filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatalf("NewStore() returned an unexpected error: %v", err)
+	}
+	defer store.Close()
+	if err := store.Save(testSnapshot()); err != nil {
+		t.Fatalf("Save() returned an unexpected error: %v", err)
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	updateDone := make(chan error, 1)
+	go func() {
+		updateDone <- store.UpdateContext(context.Background(), func(*Snapshot) error {
+			close(entered)
+			<-release
+			return nil
+		})
+	}()
+	<-entered
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- store.Close() }()
+	select {
+	case err := <-closeDone:
+		t.Fatalf("Close() returned before the in-flight operation completed: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(release)
+	if err := <-updateDone; err != nil {
+		t.Fatalf("UpdateContext() returned an unexpected error: %v", err)
+	}
+	if err := <-closeDone; err != nil {
+		t.Fatalf("Close() returned an unexpected error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("second Close() returned an unexpected error: %v", err)
+	}
+}
+
+func TestStoreOperationsReturnStableErrorAfterClose(t *testing.T) {
+	store, err := NewStore(filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatalf("NewStore() returned an unexpected error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close() returned an unexpected error: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	operations := []struct {
+		name string
+		run  func() error
+	}{
+		{name: "Load", run: func() error { _, err := store.Load(); return err }},
+		{name: "LoadContext", run: func() error { _, err := store.LoadContext(ctx); return err }},
+		{name: "Save", run: func() error { return store.Save(Snapshot{}) }},
+		{name: "SaveContext", run: func() error { return store.SaveContext(ctx, Snapshot{}) }},
+		{name: "Update", run: func() error { return store.Update(nil) }},
+		{name: "UpdateContext", run: func() error { return store.UpdateContext(ctx, nil) }},
+		{name: "CommitSubscriptionRefresh", run: func() error { _, err := store.CommitSubscriptionRefresh("", nil, nil); return err }},
+		{name: "CommitSubscriptionRefreshContext", run: func() error {
+			_, err := store.CommitSubscriptionRefreshContext(ctx, "", nil, nil)
+			return err
+		}},
+	}
+	for _, operation := range operations {
+		if err := operation.run(); err != ErrStateStoreClosed {
+			t.Errorf("%s() error = %v, want stable ErrStateStoreClosed", operation.name, err)
+		}
+	}
+}
+
+func TestStoreRepeatedConstructionAndCloseDoesNotLeakDescriptors(t *testing.T) {
+	directory := filepath.Join(t.TempDir(), "state")
+	runtime.GC()
+	before := stateOpenDescriptorCount()
+	for range 100 {
+		store, err := NewStore(directory)
+		if err != nil {
+			t.Fatalf("NewStore() returned an unexpected error: %v", err)
+		}
+		if err := store.Close(); err != nil {
+			t.Fatalf("Close() returned an unexpected error: %v", err)
+		}
+	}
+	runtime.GC()
+	after := stateOpenDescriptorCount()
+	if after > before+2 {
+		t.Fatalf("open descriptors grew from %d to %d after repeated construction and close", before, after)
+	}
+}
+
+func stateOpenDescriptorCount() int {
+	count := 0
+	for descriptor := 0; descriptor < 1024; descriptor++ {
+		if _, err := unix.FcntlInt(uintptr(descriptor), unix.F_GETFD, 0); err == nil {
+			count++
+		}
+	}
+	return count
 }
 
 func oversizedValidSnapshot() Snapshot {

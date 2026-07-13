@@ -125,6 +125,10 @@ func (store *commandStore) Delete(ctx context.Context, key string) error {
 	return errSecretCommandFailed
 }
 
+func (store *commandStore) Close() error {
+	return nil
+}
+
 func (store *commandStore) isNotFound(result CommandResult) bool {
 	if store.backend == commandBackendMacOS {
 		return result.ExitCode == 44

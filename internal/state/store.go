@@ -8,6 +8,8 @@ import (
 	"math"
 	"os"
 	"strings"
+	"sync"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -18,20 +20,22 @@ import (
 )
 
 const (
-	CurrentSchemaVersion  = 1
-	StateFileName         = "state.json"
-	StateLockFileName     = ".state.lock"
-	MaxStateSubscriptions = 1024
-	MaxStateEndpoints     = 10_000
-	maxStateFileBytes     = 64 << 20
-	maxLastErrorBytes     = 4096
-	maxRefreshInterval    = 366 * 24 * 60 * 60
+	CurrentSchemaVersion    = 1
+	StateFileName           = "state.json"
+	StateLockFileName       = ".state.lock"
+	MaxStateSubscriptions   = 1024
+	MaxStateEndpoints       = 10_000
+	maxStateFileBytes       = 64 << 20
+	maxLastErrorBytes       = 4096
+	maxRefreshInterval      = 366 * 24 * 60 * 60
+	defaultOperationTimeout = 5 * time.Second
 )
 
 var (
-	ErrStateConflict = errors.New("state revision conflict")
-	errStateStore    = errors.New("state store operation failed")
-	errInvalidState  = errors.New("state file is invalid")
+	ErrStateConflict    = errors.New("state revision conflict")
+	ErrStateStoreClosed = errors.New("state store is closed")
+	errStateStore       = errors.New("state store operation failed")
+	errInvalidState     = errors.New("state file is invalid")
 )
 
 type Snapshot struct {
@@ -42,7 +46,10 @@ type Snapshot struct {
 }
 
 type Store struct {
-	root *os.Root
+	lifecycle sync.RWMutex
+	root      *os.Root
+	closed    bool
+	closeErr  error
 }
 
 func NewStore(directory string) (*Store, error) {
@@ -58,7 +65,18 @@ func NewStore(directory string) (*Store, error) {
 }
 
 func (store *Store) Load() (Snapshot, error) {
-	lock, err := store.acquireFileLock()
+	ctx, cancel := defaultOperationContext()
+	defer cancel()
+	return store.LoadContext(ctx)
+}
+
+func (store *Store) LoadContext(ctx context.Context) (Snapshot, error) {
+	if err := store.beginOperation(); err != nil {
+		return Snapshot{}, err
+	}
+	defer store.endOperation()
+
+	lock, err := store.acquireFileLock(ctx)
 	if err != nil {
 		return Snapshot{}, err
 	}
@@ -67,10 +85,21 @@ func (store *Store) Load() (Snapshot, error) {
 }
 
 func (store *Store) Save(snapshot Snapshot) error {
+	ctx, cancel := defaultOperationContext()
+	defer cancel()
+	return store.SaveContext(ctx, snapshot)
+}
+
+func (store *Store) SaveContext(ctx context.Context, snapshot Snapshot) error {
+	if err := store.beginOperation(); err != nil {
+		return err
+	}
+	defer store.endOperation()
+
 	if err := validateSnapshot(snapshot); err != nil {
 		return errInvalidState
 	}
-	lock, err := store.acquireFileLock()
+	lock, err := store.acquireFileLock(ctx)
 	if err != nil {
 		return err
 	}
@@ -89,10 +118,24 @@ func (store *Store) Save(snapshot Snapshot) error {
 }
 
 func (store *Store) Update(update func(*Snapshot) error) error {
+	ctx, cancel := defaultOperationContext()
+	defer cancel()
+	return store.UpdateContext(ctx, update)
+}
+
+func (store *Store) UpdateContext(ctx context.Context, update func(*Snapshot) error) error {
+	if err := store.beginOperation(); err != nil {
+		return err
+	}
+	defer store.endOperation()
+	return store.updateContext(ctx, update)
+}
+
+func (store *Store) updateContext(ctx context.Context, update func(*Snapshot) error) error {
 	if update == nil {
 		return errInvalidState
 	}
-	lock, err := store.acquireFileLock()
+	lock, err := store.acquireFileLock(ctx)
 	if err != nil {
 		return err
 	}
@@ -118,6 +161,17 @@ func (store *Store) Update(update func(*Snapshot) error) error {
 }
 
 func (store *Store) CommitSubscriptionRefresh(subscriptionID string, endpoints []domain.Endpoint, refreshErr error) (bool, error) {
+	ctx, cancel := defaultOperationContext()
+	defer cancel()
+	return store.CommitSubscriptionRefreshContext(ctx, subscriptionID, endpoints, refreshErr)
+}
+
+func (store *Store) CommitSubscriptionRefreshContext(ctx context.Context, subscriptionID string, endpoints []domain.Endpoint, refreshErr error) (bool, error) {
+	if err := store.beginOperation(); err != nil {
+		return false, err
+	}
+	defer store.endOperation()
+
 	if !validStateString(subscriptionID, domain.MaxIDLength, true) {
 		return false, errInvalidState
 	}
@@ -129,7 +183,7 @@ func (store *Store) CommitSubscriptionRefresh(subscriptionID string, endpoints [
 	}
 
 	committed := false
-	err := store.Update(func(snapshot *Snapshot) error {
+	err := store.updateContext(ctx, func(snapshot *Snapshot) error {
 		if !hasSubscription(snapshot.Subscriptions, subscriptionID) {
 			return errInvalidState
 		}
@@ -149,15 +203,61 @@ func (store *Store) CommitSubscriptionRefresh(subscriptionID string, endpoints [
 	return committed, nil
 }
 
-func (store *Store) acquireFileLock() (*filelock.Lock, error) {
+func (store *Store) Close() error {
+	store.lifecycle.Lock()
+	defer store.lifecycle.Unlock()
+	if store.closed {
+		return store.closeErr
+	}
+	store.closed = true
+	if err := store.root.Close(); err != nil {
+		store.closeErr = errStateStore
+	}
+	return store.closeErr
+}
+
+func (store *Store) beginOperation() error {
+	store.lifecycle.RLock()
+	if store.closed {
+		store.lifecycle.RUnlock()
+		return ErrStateStoreClosed
+	}
+	return nil
+}
+
+func (store *Store) endOperation() {
+	store.lifecycle.RUnlock()
+}
+
+func (store *Store) acquireFileLock(ctx context.Context) (*filelock.Lock, error) {
 	if err := securepath.ValidatePrivateRoot(store.root); err != nil {
 		return nil, errStateStore
 	}
-	lock, err := filelock.Acquire(context.Background(), store.root, StateLockFileName)
-	if err != nil {
-		return nil, errStateStore
+	lock, err := filelock.Acquire(ctx, store.root, StateLockFileName)
+	if err == nil {
+		return lock, nil
 	}
-	return lock, nil
+	if contextErr := contextOperationError(ctx, err); contextErr != nil {
+		return nil, contextErr
+	}
+	return nil, errStateStore
+}
+
+func defaultOperationContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), defaultOperationTimeout)
+}
+
+func contextOperationError(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	if errors.Is(err, context.Canceled) {
+		return context.Canceled
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return context.DeadlineExceeded
+	}
+	return nil
 }
 
 func (store *Store) loadLocked() (Snapshot, error) {

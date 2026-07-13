@@ -17,12 +17,16 @@ const (
 	nativeBackendProbeTimeout = 2 * time.Second
 )
 
-var ErrSecretNotFound = errors.New("secret was not found")
+var (
+	ErrSecretNotFound    = errors.New("secret was not found")
+	ErrSecretStoreClosed = errors.New("secret store is closed")
+)
 
 type Store interface {
 	Get(context.Context, string) (string, error)
 	Set(context.Context, string, string) error
 	Delete(context.Context, string) error
+	Close() error
 }
 
 type BackendInfo struct {

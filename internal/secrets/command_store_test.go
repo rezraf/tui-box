@@ -15,6 +15,7 @@ func TestMacOSKeychainInvokesSecurityWithSafeArguments(t *testing.T) {
 	const secret = "https://user:password@example.com/private?token=query-secret"
 	runner := &recordingRunner{result: CommandResult{Stdout: []byte(secret + "\n")}}
 	store := newMacOSKeychainStore(runner)
+	defer store.Close()
 
 	if err := store.Set(context.Background(), "subscription-1", secret); err != nil {
 		t.Fatalf("Set() returned an unexpected error: %v", err)
@@ -54,6 +55,7 @@ func TestMacOSKeychainPasswordPromptFlagIsLastAndSecretUsesStdin(t *testing.T) {
 	const secret = "https://user:password@example.com/private?token=query-secret"
 	runner := &recordingRunner{}
 	store := newMacOSKeychainStore(runner)
+	defer store.Close()
 
 	if err := store.Set(context.Background(), "subscription-1", secret); err != nil {
 		t.Fatalf("Set() returned an unexpected error: %v", err)
@@ -82,6 +84,7 @@ func TestLinuxSecretServiceInvokesSecretToolWithSafeArguments(t *testing.T) {
 	const secret = "https://user:password@example.com/private?token=query-secret"
 	runner := &recordingRunner{result: CommandResult{Stdout: []byte(secret + "\n")}}
 	store := newLinuxSecretServiceStore("/usr/bin/secret-tool", runner)
+	defer store.Close()
 
 	if err := store.Set(context.Background(), "subscription-1", secret); err != nil {
 		t.Fatalf("Set() returned an unexpected error: %v", err)
@@ -144,6 +147,7 @@ func TestCommandStoreNormalizesMissingSecretsAcrossBackends(t *testing.T) {
 			t.Parallel()
 			runner := &recordingRunner{result: test.result, err: errors.New("native command failed")}
 			store := test.store(runner)
+			defer store.Close()
 			if _, err := store.Get(context.Background(), "subscription-1"); !errors.Is(err, ErrSecretNotFound) {
 				t.Fatalf("Get() error = %v, want ErrSecretNotFound", err)
 			}
@@ -173,7 +177,9 @@ func TestCommandStoreRedactsRunnerErrors(t *testing.T) {
 				result: CommandResult{ExitCode: 2, Stderr: []byte("failed with " + secret)},
 				err:    errors.New("failed with " + secret),
 			}
-			err := operation.run(newLinuxSecretServiceStore("/usr/bin/secret-tool", runner))
+			store := newLinuxSecretServiceStore("/usr/bin/secret-tool", runner)
+			defer store.Close()
+			err := operation.run(store)
 			if err == nil {
 				t.Fatalf("%s() returned nil error, want runner failure", operation.name)
 			}
@@ -192,6 +198,7 @@ func TestCommandStorePreservesContextErrorIdentity(t *testing.T) {
 	for _, contextErr := range []error{context.Canceled, context.DeadlineExceeded} {
 		runner := &recordingRunner{result: CommandResult{ExitCode: 1}, err: contextErr}
 		store := newLinuxSecretServiceStore("/usr/bin/secret-tool", runner)
+		defer store.Close()
 		if _, err := store.Get(context.Background(), "subscription-1"); !errors.Is(err, contextErr) {
 			t.Fatalf("Get() error = %v, want %v identity", err, contextErr)
 		}
@@ -209,11 +216,26 @@ func TestCommandStoreRejectsUnsafeKeysBeforeExecution(t *testing.T) {
 
 	runner := &recordingRunner{}
 	store := newLinuxSecretServiceStore("/usr/bin/secret-tool", runner)
+	defer store.Close()
 	if err := store.Set(context.Background(), "--unsafe\nkey", "secret"); err == nil {
 		t.Fatal("Set() returned nil error, want unsafe key rejection")
 	}
 	if len(runner.commands()) != 0 {
 		t.Fatal("runner was invoked for an unsafe key")
+	}
+}
+
+func TestCommandStoreCloseIsNoOp(t *testing.T) {
+	runner := &recordingRunner{result: CommandResult{Stdout: []byte("secret\n")}}
+	store := newLinuxSecretServiceStore("/usr/bin/secret-tool", runner)
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close() returned an unexpected error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("second Close() returned an unexpected error: %v", err)
+	}
+	if value, err := store.Get(context.Background(), "subscription-1"); err != nil || value != "secret" {
+		t.Fatalf("Get() after no-op Close() = (%q, %v), want command store to remain usable", value, err)
 	}
 }
 

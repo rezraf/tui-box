@@ -41,6 +41,7 @@ func TestNewStoreChoosesNativeBackendWhenExecutableExists(t *testing.T) {
 			if store == nil {
 				t.Fatal("newStore() returned nil store")
 			}
+			defer store.Close()
 			if lookedUp != test.wantLookup {
 				t.Fatalf("looked up executable %q, want %q", lookedUp, test.wantLookup)
 			}
@@ -72,6 +73,7 @@ func TestNewStoreFallsBackToFileWhenNativeProbeFails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newStore() returned an unexpected error: %v", err)
 	}
+	defer store.Close()
 	if info.Name != BackendFile || info.Warning == "" {
 		t.Fatalf("backend info = %#v, want file backend with warning", info)
 	}
@@ -95,6 +97,7 @@ func TestNewStoreFallsBackToFileAndExposesWarning(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newStore() returned an unexpected error: %v", err)
 	}
+	defer store.Close()
 	if info.Name != BackendFile || info.Warning == "" {
 		t.Fatalf("backend info = %#v, want file backend with warning", info)
 	}

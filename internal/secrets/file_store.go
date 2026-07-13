@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"sync"
 	"unicode/utf8"
 
 	"github.com/rezraf/tui-box/internal/filelock"
@@ -23,7 +24,10 @@ const (
 var errFallbackStore = errors.New("local secret store operation failed")
 
 type fileStore struct {
-	root *os.Root
+	lifecycle sync.RWMutex
+	root      *os.Root
+	closed    bool
+	closeErr  error
 }
 
 func newFileStore(directory string) (*fileStore, error) {
@@ -39,6 +43,11 @@ func newFileStore(directory string) (*fileStore, error) {
 }
 
 func (store *fileStore) Get(ctx context.Context, key string) (string, error) {
+	if err := store.beginOperation(); err != nil {
+		return "", err
+	}
+	defer store.endOperation()
+
 	if !validSecretKey(key) {
 		return "", errors.New("secret key is invalid")
 	}
@@ -62,6 +71,11 @@ func (store *fileStore) Get(ctx context.Context, key string) (string, error) {
 }
 
 func (store *fileStore) Set(ctx context.Context, key, secret string) error {
+	if err := store.beginOperation(); err != nil {
+		return err
+	}
+	defer store.endOperation()
+
 	if !validSecretKey(key) {
 		return errors.New("secret key is invalid")
 	}
@@ -85,6 +99,11 @@ func (store *fileStore) Set(ctx context.Context, key, secret string) error {
 }
 
 func (store *fileStore) Delete(ctx context.Context, key string) error {
+	if err := store.beginOperation(); err != nil {
+		return err
+	}
+	defer store.endOperation()
+
 	if !validSecretKey(key) {
 		return errors.New("secret key is invalid")
 	}
@@ -105,6 +124,32 @@ func (store *fileStore) Delete(ctx context.Context, key string) error {
 	}
 	delete(values, key)
 	return store.writeLocked(values)
+}
+
+func (store *fileStore) Close() error {
+	store.lifecycle.Lock()
+	defer store.lifecycle.Unlock()
+	if store.closed {
+		return store.closeErr
+	}
+	store.closed = true
+	if err := store.root.Close(); err != nil {
+		store.closeErr = errFallbackStore
+	}
+	return store.closeErr
+}
+
+func (store *fileStore) beginOperation() error {
+	store.lifecycle.RLock()
+	if store.closed {
+		store.lifecycle.RUnlock()
+		return ErrSecretStoreClosed
+	}
+	return nil
+}
+
+func (store *fileStore) endOperation() {
+	store.lifecycle.RUnlock()
 }
 
 func (store *fileStore) acquireFileLock(ctx context.Context) (*filelock.Lock, error) {
