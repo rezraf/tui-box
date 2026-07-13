@@ -78,9 +78,10 @@ type preparedState struct {
 }
 
 type execRunner struct {
-	executable     string
-	executableInfo os.FileInfo
-	runtimeRoot    *os.Root
+	executable       string
+	executableInfo   os.FileInfo
+	executableDigest [sha256.Size]byte
+	runtimeRoot      *os.Root
 
 	mu       sync.Mutex
 	prepared map[*PreparedConfig]*preparedState
@@ -92,15 +93,20 @@ func NewRunner(executable, runtimeDirectory string) (Runner, error) {
 	if err != nil {
 		return nil, err
 	}
+	executableDigest, err := digestExecutable(trustedPath, executableInfo)
+	if err != nil {
+		return nil, ErrInvalidExecutable
+	}
 	runtimeRoot, err := openRuntimeRoot(runtimeDirectory)
 	if err != nil {
 		return nil, err
 	}
 	return &execRunner{
-		executable:     trustedPath,
-		executableInfo: executableInfo,
-		runtimeRoot:    runtimeRoot,
-		prepared:       make(map[*PreparedConfig]*preparedState),
+		executable:       trustedPath,
+		executableInfo:   executableInfo,
+		executableDigest: executableDigest,
+		runtimeRoot:      runtimeRoot,
+		prepared:         make(map[*PreparedConfig]*preparedState),
 	}, nil
 }
 
@@ -132,6 +138,33 @@ func inspectExecutable(input string) (string, os.FileInfo, error) {
 		return "", nil, err
 	}
 	return resolved, info, nil
+}
+
+func digestExecutable(path string, expected os.FileInfo) ([sha256.Size]byte, error) {
+	before, err := os.Lstat(path)
+	if err != nil || !os.SameFile(expected, before) {
+		return [sha256.Size]byte{}, ErrInvalidExecutable
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return [sha256.Size]byte{}, ErrInvalidExecutable
+	}
+	defer file.Close()
+	opened, err := file.Stat()
+	if err != nil || !opened.Mode().IsRegular() || !os.SameFile(before, opened) {
+		return [sha256.Size]byte{}, ErrInvalidExecutable
+	}
+	digest := sha256.New()
+	if _, err := io.Copy(digest, file); err != nil {
+		return [sha256.Size]byte{}, ErrInvalidExecutable
+	}
+	after, err := os.Lstat(path)
+	if err != nil || !os.SameFile(opened, after) {
+		return [sha256.Size]byte{}, ErrInvalidExecutable
+	}
+	var result [sha256.Size]byte
+	copy(result[:], digest.Sum(nil))
+	return result, nil
 }
 
 func inspectTrustedParents(directory string) error {
@@ -472,6 +505,10 @@ func (runner *execRunner) inspectRuntimeRoot() error {
 func (runner *execRunner) inspectExecutable() error {
 	resolved, info, err := inspectExecutable(runner.executable)
 	if err != nil || resolved != runner.executable || !os.SameFile(runner.executableInfo, info) {
+		return ErrInvalidExecutable
+	}
+	digest, err := digestExecutable(resolved, info)
+	if err != nil || digest != runner.executableDigest {
 		return ErrInvalidExecutable
 	}
 	return nil

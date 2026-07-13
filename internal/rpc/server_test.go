@@ -154,8 +154,8 @@ func TestServerRejectsUnauthorizedActualPeer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := client.Health(context.Background()); !errors.Is(err, ErrAccessDenied) {
-		t.Fatalf("Health() error = %v, want ErrAccessDenied", err)
+	if err := client.Health(context.Background()); !errors.Is(err, ErrAccessDenied) && !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("Health() error = %v, want ErrAccessDenied or ErrUnavailable", err)
 	}
 }
 

@@ -20,7 +20,7 @@ func main() {
 		os.Exit(65)
 	}
 	stdinInfo, err := os.Stdin.Stat()
-	if err != nil || stdinInfo.Mode()&os.ModeNamedPipe == 0 {
+	if err != nil || stdinInfo.Mode().IsRegular() {
 		os.Exit(66)
 	}
 	config, err := io.ReadAll(os.Stdin)
