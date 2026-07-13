@@ -21,6 +21,8 @@ import (
 )
 
 const (
+	defaultAuthTimeout      = 250 * time.Millisecond
+	maxAuthTimeout          = 5 * time.Second
 	defaultReadTimeout      = 5 * time.Second
 	defaultWriteTimeout     = 5 * time.Second
 	defaultOperationTimeout = 30 * time.Second
@@ -34,7 +36,7 @@ var ErrUnsafeSocketPath = errors.New("unsafe Unix socket path")
 type Handler interface {
 	Connect(context.Context, core.ConnectionRequest) (SessionStatus, error)
 	Disconnect(context.Context) (SessionStatus, error)
-	Status(context.Context) SessionStatus
+	Status(context.Context) (SessionStatus, error)
 	Health(context.Context) error
 }
 
@@ -43,6 +45,7 @@ type ServerConfig struct {
 	SocketGID        int
 	AllowedUIDs      []int
 	Handler          Handler
+	AuthTimeout      time.Duration
 	ReadTimeout      time.Duration
 	WriteTimeout     time.Duration
 	OperationTimeout time.Duration
@@ -55,6 +58,8 @@ type Server struct {
 	socketInfo       os.FileInfo
 	handler          Handler
 	allowedUIDs      map[int]struct{}
+	peerCredentials  func(*net.UnixConn) (PeerCredentials, error)
+	authTimeout      time.Duration
 	readTimeout      time.Duration
 	writeTimeout     time.Duration
 	operationTimeout time.Duration
@@ -127,6 +132,8 @@ func NewServer(config ServerConfig) (*Server, error) {
 		socketInfo:       info,
 		handler:          normalized.Handler,
 		allowedUIDs:      allowedUIDs,
+		peerCredentials:  kernelPeerCredentials,
+		authTimeout:      normalized.AuthTimeout,
 		readTimeout:      normalized.ReadTimeout,
 		writeTimeout:     normalized.WriteTimeout,
 		operationTimeout: normalized.OperationTimeout,
@@ -143,6 +150,12 @@ func validateServerConfig(config ServerConfig) (ServerConfig, map[int]struct{}, 
 	if config.Handler == nil || !validSocketPathString(config.SocketPath) || config.SocketGID < 0 || uint64(config.SocketGID) > math.MaxUint32 {
 		return ServerConfig{}, nil, ErrUnsafeSocketPath
 	}
+	if len(config.AllowedUIDs) == 0 {
+		return ServerConfig{}, nil, ErrInvalidRequest
+	}
+	if config.AuthTimeout == 0 {
+		config.AuthTimeout = defaultAuthTimeout
+	}
 	if config.ReadTimeout == 0 {
 		config.ReadTimeout = defaultReadTimeout
 	}
@@ -155,7 +168,7 @@ func validateServerConfig(config ServerConfig) (ServerConfig, map[int]struct{}, 
 	if config.MaxConcurrent == 0 {
 		config.MaxConcurrent = defaultMaxConcurrent
 	}
-	if config.ReadTimeout < 0 || config.ReadTimeout > maxRPCDuration || config.WriteTimeout < 0 || config.WriteTimeout > maxRPCDuration ||
+	if config.AuthTimeout < 0 || config.AuthTimeout > maxAuthTimeout || config.ReadTimeout < 0 || config.ReadTimeout > maxRPCDuration || config.WriteTimeout < 0 || config.WriteTimeout > maxRPCDuration ||
 		config.OperationTimeout < 0 || config.OperationTimeout > maxRPCDuration || config.MaxConcurrent < 1 || config.MaxConcurrent > maxConcurrentLimit {
 		return ServerConfig{}, nil, ErrInvalidRequest
 	}
@@ -242,16 +255,20 @@ func (server *Server) Serve() error {
 			}
 			return err
 		}
+		if !server.beginConnection(connection) {
+			_ = connection.Close()
+			continue
+		}
+		peer, authorized := server.authenticateConnection(connection)
+		if !authorized {
+			server.endConnection(connection, false)
+			continue
+		}
 		select {
 		case server.semaphore <- struct{}{}:
-			if server.beginConnection(connection) {
-				go server.serveConnection(connection)
-			} else {
-				<-server.semaphore
-				_ = connection.Close()
-			}
+			go server.serveConnection(connection, peer)
 		default:
-			_ = connection.Close()
+			server.endConnection(connection, false)
 		}
 	}
 }
@@ -267,15 +284,34 @@ func (server *Server) beginConnection(connection *net.UnixConn) bool {
 	return true
 }
 
-func (server *Server) serveConnection(connection *net.UnixConn) {
-	defer func() {
-		server.mu.Lock()
-		delete(server.connections, connection)
-		server.mu.Unlock()
-		_ = connection.Close()
+func (server *Server) authenticateConnection(connection *net.UnixConn) (PeerCredentials, bool) {
+	if err := connection.SetDeadline(time.Now().Add(server.authTimeout)); err != nil {
+		return PeerCredentials{}, false
+	}
+	peer, err := server.peerCredentials(connection)
+	if err != nil || !peerAuthorized(peer, server.allowedUIDs) {
+		server.writeResponseFrame(connection, responseForError("", ErrAccessDenied))
+		return PeerCredentials{}, false
+	}
+	if err := connection.SetDeadline(time.Time{}); err != nil {
+		return PeerCredentials{}, false
+	}
+	return peer, true
+}
+
+func (server *Server) endConnection(connection *net.UnixConn, admitted bool) {
+	server.mu.Lock()
+	delete(server.connections, connection)
+	server.mu.Unlock()
+	_ = connection.Close()
+	if admitted {
 		<-server.semaphore
-		server.wait.Done()
-	}()
+	}
+	server.wait.Done()
+}
+
+func (server *Server) serveConnection(connection *net.UnixConn, peer PeerCredentials) {
+	defer server.endConnection(connection, true)
 
 	_ = connection.SetReadDeadline(time.Now().Add(server.readTimeout))
 	body, err := readFrame(connection)
@@ -296,12 +332,6 @@ func (server *Server) serveConnection(connection *net.UnixConn) {
 		server.writeResponse(connection, responseForError(responseID, err))
 		return
 	}
-	peer, err := kernelPeerCredentials(connection)
-	if err != nil || !peerAuthorized(peer, server.allowedUIDs) {
-		server.writeResponse(connection, responseForError(request.ID, ErrAccessDenied))
-		return
-	}
-
 	operationContext, cancel := context.WithTimeout(server.ctx, server.operationTimeout)
 	defer cancel()
 	response := server.dispatch(operationContext, request, peer)
@@ -340,7 +370,10 @@ func (server *Server) dispatch(ctx context.Context, request Request, peer PeerCr
 		}
 		response.Status = &status
 	case OperationStatus:
-		status := server.handler.Status(ctx)
+		status, err := server.handler.Status(ctx)
+		if err != nil {
+			return responseForError(request.ID, err)
+		}
 		if !validSessionStatus(status) {
 			return responseForError(request.ID, ErrInternal)
 		}
@@ -358,6 +391,10 @@ func (server *Server) dispatch(ctx context.Context, request Request, peer PeerCr
 
 func (server *Server) writeResponse(connection *net.UnixConn, response Response) {
 	_ = connection.SetWriteDeadline(time.Now().Add(server.writeTimeout))
+	server.writeResponseFrame(connection, response)
+}
+
+func (server *Server) writeResponseFrame(connection *net.UnixConn, response Response) {
 	encoded, err := json.Marshal(response)
 	if err != nil || len(encoded) > MaxMessageBytes {
 		encoded, _ = json.Marshal(responseForError(response.ID, ErrInternal))
@@ -402,9 +439,6 @@ func readFrame(reader io.Reader) ([]byte, error) {
 }
 
 func peerAuthorized(peer PeerCredentials, allowed map[int]struct{}) bool {
-	if peer.UID == 0 {
-		return true
-	}
 	_, exists := allowed[peer.UID]
 	return exists
 }

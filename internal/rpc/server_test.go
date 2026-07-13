@@ -63,35 +63,48 @@ func TestServerClientIntegrationDerivesKernelPeerIdentity(t *testing.T) {
 	}
 }
 
-func TestServerAuthorizesOnlyRootOrExplicitUIDs(t *testing.T) {
+func TestServerAuthorizesOnlyExplicitUIDs(t *testing.T) {
 	t.Parallel()
 
-	allowed := map[int]struct{}{501: {}}
 	for _, test := range []struct {
-		name string
-		peer PeerCredentials
-		want bool
+		name    string
+		allowed map[int]struct{}
+		peer    PeerCredentials
+		want    bool
 	}{
-		{name: "root", peer: PeerCredentials{UID: 0, GID: 0}, want: true},
-		{name: "allowlisted", peer: PeerCredentials{UID: 501, GID: 20}, want: true},
-		{name: "same group only", peer: PeerCredentials{UID: 502, GID: 20}, want: false},
-		{name: "other", peer: PeerCredentials{UID: 65534, GID: 65534}, want: false},
+		{name: "root omitted", allowed: map[int]struct{}{501: {}}, peer: PeerCredentials{UID: 0, GID: 0}, want: false},
+		{name: "root explicit", allowed: map[int]struct{}{0: {}}, peer: PeerCredentials{UID: 0, GID: 0}, want: true},
+		{name: "allowlisted", allowed: map[int]struct{}{501: {}}, peer: PeerCredentials{UID: 501, GID: 20}, want: true},
+		{name: "same group only", allowed: map[int]struct{}{501: {}}, peer: PeerCredentials{UID: 502, GID: 20}, want: false},
+		{name: "other", allowed: map[int]struct{}{501: {}}, peer: PeerCredentials{UID: 65534, GID: 65534}, want: false},
 	} {
 		test := test
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			if got := peerAuthorized(test.peer, allowed); got != test.want {
+			if got := peerAuthorized(test.peer, test.allowed); got != test.want {
 				t.Fatalf("peerAuthorized(%#v) = %v, want %v", test.peer, got, test.want)
 			}
 		})
 	}
 }
 
-func TestServerRejectsUnauthorizedActualPeer(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("root is intentionally always authorized")
+func TestNewServerRejectsEmptyUIDAllowlist(t *testing.T) {
+	directory := privateSocketDirectory(t)
+	server, err := NewServer(ServerConfig{
+		SocketPath:  filepath.Join(directory, "tuiboxd.sock"),
+		SocketGID:   os.Getegid(),
+		AllowedUIDs: nil,
+		Handler:     &testHandler{},
+	})
+	if server != nil {
+		_ = server.Close()
 	}
+	if !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("NewServer(empty allowlist) = %#v, %v, want ErrInvalidRequest", server, err)
+	}
+}
 
+func TestServerRejectsUnauthorizedActualPeer(t *testing.T) {
 	directory := privateSocketDirectory(t)
 	server, err := NewServer(ServerConfig{
 		SocketPath:   filepath.Join(directory, "tuiboxd.sock"),
@@ -113,6 +126,111 @@ func TestServerRejectsUnauthorizedActualPeer(t *testing.T) {
 	}
 	if err := client.Health(context.Background()); !errors.Is(err, ErrAccessDenied) {
 		t.Fatalf("Health() error = %v, want ErrAccessDenied", err)
+	}
+}
+
+func TestSaturatedServerAuthenticatesBeforeRejectingUnauthorizedPeer(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	handler := &testHandler{health: func(ctx context.Context) error {
+		close(entered)
+		select {
+		case <-release:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}}
+	directory := privateSocketDirectory(t)
+	server, err := NewServer(ServerConfig{
+		SocketPath:       filepath.Join(directory, "tuiboxd.sock"),
+		SocketGID:        os.Getegid(),
+		AllowedUIDs:      []int{os.Geteuid()},
+		Handler:          handler,
+		ReadTimeout:      time.Second,
+		WriteTimeout:     time.Second,
+		OperationTimeout: time.Second,
+		MaxConcurrent:    1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	unauthorizedUID := 0
+	if os.Geteuid() == 0 {
+		unauthorizedUID = 1
+	}
+	var credentialCalls atomic.Int32
+	server.peerCredentials = func(*net.UnixConn) (PeerCredentials, error) {
+		if credentialCalls.Add(1) == 1 {
+			return PeerCredentials{UID: os.Geteuid(), GID: os.Getegid()}, nil
+		}
+		return PeerCredentials{UID: unauthorizedUID, GID: os.Getegid()}, nil
+	}
+	startServer(t, server)
+	defer server.Close()
+	client, err := NewClient(server.SocketPath(), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- client.Health(context.Background()) }()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("first request did not saturate the admitted peer slot")
+	}
+
+	unauthorized := dialUnix(t, server.SocketPath())
+	defer unauthorized.Close()
+	if err := unauthorized.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	response, err := bufio.NewReader(unauthorized).ReadBytes('\n')
+	if err != nil {
+		close(release)
+		<-firstDone
+		t.Fatalf("unauthorized peer was rejected as saturation before authentication: %v", err)
+	}
+	if !strings.Contains(string(response), string(CodeAccessDenied)) {
+		close(release)
+		<-firstDone
+		t.Fatalf("unauthorized saturated response = %s, want access_denied", response)
+	}
+
+	close(release)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first request failed: %v", err)
+	}
+}
+
+func TestAdmittedPeerUsesNormalDeadlineAfterShortAuthenticationDeadline(t *testing.T) {
+	server, socketPath := newTestServer(t, &testHandler{}, ServerConfig{
+		AuthTimeout: 20 * time.Millisecond,
+		ReadTimeout: 250 * time.Millisecond,
+	})
+	defer server.Close()
+
+	connection := dialUnix(t, socketPath)
+	defer connection.Close()
+	time.Sleep(60 * time.Millisecond)
+	request, err := encodeLine(Request{Version: ProtocolVersion, ID: "delayed", Operation: OperationHealth})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := connection.Write(request); err != nil {
+		t.Fatalf("write after authentication deadline failed: %v", err)
+	}
+	if err := connection.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	body, err := bufio.NewReader(connection).ReadBytes('\n')
+	if err != nil {
+		t.Fatalf("read after authentication deadline failed: %v", err)
+	}
+	response, err := decodeResponse(bytesTrimSuffix(body, '\n'))
+	if err != nil || !response.OK || response.Health == nil {
+		t.Fatalf("delayed admitted response = %#v, %v", response, err)
 	}
 }
 
@@ -439,7 +557,7 @@ type testHandler struct {
 	request    core.ConnectionRequest
 	connect    func(context.Context, core.ConnectionRequest) (SessionStatus, error)
 	disconnect func(context.Context) (SessionStatus, error)
-	status     func(context.Context) SessionStatus
+	status     func(context.Context) (SessionStatus, error)
 	health     func(context.Context) error
 }
 
@@ -460,11 +578,11 @@ func (handler *testHandler) Disconnect(ctx context.Context) (SessionStatus, erro
 	return SessionStatus{State: domain.ConnectionStatusDisconnected}, nil
 }
 
-func (handler *testHandler) Status(ctx context.Context) SessionStatus {
+func (handler *testHandler) Status(ctx context.Context) (SessionStatus, error) {
 	if handler.status != nil {
 		return handler.status(ctx)
 	}
-	return SessionStatus{State: domain.ConnectionStatusDisconnected}
+	return SessionStatus{State: domain.ConnectionStatusDisconnected}, nil
 }
 
 func (handler *testHandler) Health(ctx context.Context) error {
@@ -492,6 +610,9 @@ func newTestServer(t *testing.T, handler Handler, overrides ServerConfig) (*Serv
 		WriteTimeout:     time.Second,
 		OperationTimeout: time.Second,
 		MaxConcurrent:    8,
+	}
+	if overrides.AuthTimeout != 0 {
+		config.AuthTimeout = overrides.AuthTimeout
 	}
 	if overrides.ReadTimeout != 0 {
 		config.ReadTimeout = overrides.ReadTimeout
@@ -550,6 +671,13 @@ func dialUnix(t *testing.T, path string) *net.UnixConn {
 		t.Fatal(err)
 	}
 	return connection
+}
+
+func bytesTrimSuffix(input []byte, suffix byte) []byte {
+	if len(input) > 0 && input[len(input)-1] == suffix {
+		return input[:len(input)-1]
+	}
+	return input
 }
 
 func bytesCount(input []byte, value byte) int {

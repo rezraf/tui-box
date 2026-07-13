@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net/netip"
+	"strings"
 	"unicode/utf8"
 
 	"github.com/rezraf/tui-box/internal/core"
@@ -60,6 +61,8 @@ type Request struct {
 	ID        string          `json:"id"`
 	Operation Operation       `json:"operation"`
 	Connect   *ConnectPayload `json:"connect,omitempty"`
+
+	connectPresent bool
 }
 
 type ConnectPayload struct {
@@ -112,6 +115,11 @@ func decodeRequest(data []byte) (Request, error) {
 	if err := decodeStrict(data, &request); err != nil {
 		return Request{}, ErrInvalidRequest
 	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return Request{}, ErrInvalidRequest
+	}
+	_, request.connectPresent = fields["connect"]
 	return request, nil
 }
 
@@ -177,10 +185,14 @@ func consumeJSONValue(decoder *json.Decoder) error {
 			if !ok {
 				return ErrInvalidRequest
 			}
-			if _, duplicate := seen[key]; duplicate {
+			canonicalKey := strings.ToLower(key)
+			if _, duplicate := seen[canonicalKey]; duplicate {
 				return ErrInvalidRequest
 			}
-			seen[key] = struct{}{}
+			seen[canonicalKey] = struct{}{}
+			if key != canonicalKey {
+				return ErrInvalidRequest
+			}
 			if err := consumeJSONValue(decoder); err != nil {
 				return err
 			}
@@ -212,13 +224,14 @@ func validateRequest(request Request) error {
 	if !validRequestID(request.ID) {
 		return ErrInvalidRequest
 	}
+	connectPresent := request.connectPresent || request.Connect != nil
 	switch request.Operation {
 	case OperationConnect:
-		if request.Connect == nil {
+		if !connectPresent || request.Connect == nil {
 			return ErrInvalidRequest
 		}
 	case OperationDisconnect, OperationStatus, OperationHealth:
-		if request.Connect != nil {
+		if connectPresent {
 			return ErrInvalidRequest
 		}
 	default:

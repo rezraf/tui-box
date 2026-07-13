@@ -36,7 +36,12 @@ func TestDecodeRequestAcceptsOnlyOneStrictJSONValue(t *testing.T) {
 		{name: "unknown nested field", body: []byte(`{"version":1,"id":"request-1","operation":"connect","connect":{"mode":"tun","route":"direct","extra":true}}`)},
 		{name: "unknown endpoint field", body: []byte(`{"version":1,"id":"request-1","operation":"connect","connect":{"mode":"tun","route":"global","endpoint":{"id":"id","subscription_id":"sub","name":"name","protocol":"shadowsocks","host":"example.com","port":443,"password":"secret","method":"aes-128-gcm","tls":{"enabled":false},"transport":{},"uid":501}}}`)},
 		{name: "duplicate top-level key", body: []byte(`{"version":1,"version":1,"id":"request-1","operation":"health"}`)},
+		{name: "case-insensitive duplicate top-level key", body: []byte(`{"version":1,"Version":1,"id":"request-1","operation":"health"}`)},
 		{name: "duplicate nested key", body: []byte(`{"version":1,"id":"request-1","operation":"connect","connect":{"mode":"tun","mode":"proxy","route":"direct"}}`)},
+		{name: "case-insensitive duplicate endpoint key", body: []byte(`{"version":1,"id":"request-1","operation":"connect","connect":{"mode":"tun","route":"global","endpoint":{"host":"example.com","HOST":"other.example"}}}`)},
+		{name: "case-insensitive duplicate deep key", body: []byte(`{"version":1,"id":"request-1","operation":"connect","connect":{"mode":"tun","route":"global","endpoint":{"tls":{"reality":{"public_key":"one","PUBLIC_KEY":"two"}}}}}`)},
+		{name: "mixed-case top-level schema key", body: []byte(`{"Version":1,"id":"request-1","operation":"health"}`)},
+		{name: "mixed-case nested schema key", body: []byte(`{"version":1,"id":"request-1","operation":"connect","connect":{"Mode":"tun","route":"direct"}}`)},
 		{name: "trailing JSON", body: []byte(`{"version":1,"id":"request-1","operation":"health"} {}`)},
 		{name: "empty", body: nil},
 		{name: "null", body: []byte(`null`)},
@@ -49,6 +54,74 @@ func TestDecodeRequestAcceptsOnlyOneStrictJSONValue(t *testing.T) {
 				t.Fatalf("decodeRequest() error = %v, want ErrInvalidRequest", err)
 			}
 		})
+	}
+}
+
+func TestDecodedRequestDistinguishesMissingNullAndPresentConnect(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		body    string
+		wantErr error
+	}{
+		{
+			name:    "connect missing field",
+			body:    `{"version":1,"id":"request-1","operation":"connect"}`,
+			wantErr: ErrInvalidRequest,
+		},
+		{
+			name:    "connect null field",
+			body:    `{"version":1,"id":"request-1","operation":"connect","connect":null}`,
+			wantErr: ErrInvalidRequest,
+		},
+		{
+			name: "health omits field",
+			body: `{"version":1,"id":"request-1","operation":"health"}`,
+		},
+		{
+			name:    "health forbids null field",
+			body:    `{"version":1,"id":"request-1","operation":"health","connect":null}`,
+			wantErr: ErrInvalidRequest,
+		},
+		{
+			name:    "disconnect forbids null field",
+			body:    `{"version":1,"id":"request-1","operation":"disconnect","connect":null}`,
+			wantErr: ErrInvalidRequest,
+		},
+		{
+			name:    "status forbids null field",
+			body:    `{"version":1,"id":"request-1","operation":"status","connect":null}`,
+			wantErr: ErrInvalidRequest,
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			request, err := decodeRequest([]byte(test.body))
+			if err != nil {
+				t.Fatalf("decodeRequest() failed before semantic validation: %v", err)
+			}
+			err = validateRequest(request)
+			if !errors.Is(err, test.wantErr) {
+				t.Fatalf("validateRequest() error = %v, want %v", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestDecodeResponseRequiresExactLowerCaseKeysAtEveryDepth(t *testing.T) {
+	t.Parallel()
+
+	for _, body := range []string{
+		`{"Version":1,"id":"request-1","ok":true,"health":{"ready":true}}`,
+		`{"version":1,"id":"request-1","ok":true,"health":{"Ready":true}}`,
+		`{"version":1,"id":"request-1","ok":false,"error":{"code":"access_denied","Code":"access_denied","message":"access is denied"}}`,
+	} {
+		if _, err := decodeResponse([]byte(body)); !errors.Is(err, ErrInvalidResponse) {
+			t.Fatalf("decodeResponse(%s) error = %v, want ErrInvalidResponse", body, err)
+		}
 	}
 }
 

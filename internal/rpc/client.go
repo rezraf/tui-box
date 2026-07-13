@@ -113,6 +113,9 @@ func (client *Client) call(ctx context.Context, operation Operation, payload *Co
 	if err != nil {
 		return Response{}, ErrInvalidResponse
 	}
+	if isPreAuthAccessDenied(response) {
+		return Response{}, ErrAccessDenied
+	}
 	if err := validateResponse(response, requestID); err != nil {
 		return Response{}, err
 	}
@@ -123,6 +126,11 @@ func (client *Client) call(ctx context.Context, operation Operation, payload *Co
 		return Response{}, ErrInvalidResponse
 	}
 	return response, nil
+}
+
+func isPreAuthAccessDenied(response Response) bool {
+	return response.Version == ProtocolVersion && response.ID == "" && !response.OK && response.Status == nil && response.Health == nil &&
+		response.Error != nil && response.Error.Code == CodeAccessDenied && response.Error.Message == messageForCode(CodeAccessDenied)
 }
 
 func newRequestID() (string, error) {

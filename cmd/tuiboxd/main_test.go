@@ -34,6 +34,24 @@ func TestParseOptionsAcceptsOnlyRequiredFixedFlags(t *testing.T) {
 	}
 }
 
+func TestParseOptionsAcceptsExplicitRootUID(t *testing.T) {
+	t.Parallel()
+
+	options, err := parseOptions([]string{
+		"--core", "/opt/tuibox/sing-box",
+		"--runtime-dir", "/var/lib/tuibox",
+		"--socket", "/var/run/tuibox/tuiboxd.sock",
+		"--socket-gid", "0",
+		"--allow-uid", "0",
+	})
+	if err != nil {
+		t.Fatalf("parseOptions(explicit UID 0) failed: %v", err)
+	}
+	if want := []int{0}; !reflect.DeepEqual(options.allowedUIDs, want) {
+		t.Fatalf("allowed UIDs = %v, want explicit root UID", options.allowedUIDs)
+	}
+}
+
 func TestParseOptionsRejectsInvalidConfiguration(t *testing.T) {
 	t.Parallel()
 
