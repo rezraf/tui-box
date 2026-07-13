@@ -6,7 +6,7 @@
   - Verify: `go test ./internal/subscription`
 - [x] Add bounded HTTPS fetching, hybrid secret storage, and atomic state
   - Verify: `go test ./internal/subscription ./internal/secrets ./internal/state`
-- [ ] Generate typed sing-box configs for both connection modes and three route modes
+- [x] Generate typed sing-box configs for both connection modes and three route modes
   - Verify: `go test ./internal/core`
 - [ ] Add peer-authenticated Unix RPC and daemon lifecycle
   - Verify: `go test ./internal/rpc ./internal/daemon`
