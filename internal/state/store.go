@@ -38,11 +38,16 @@ var (
 	errInvalidState     = errors.New("state file is invalid")
 )
 
+type Settings struct {
+	TelemetryEnabled bool `json:"telemetry_enabled"`
+}
+
 type Snapshot struct {
 	SchemaVersion int                   `json:"schema_version"`
 	Revision      uint64                `json:"revision"`
 	Subscriptions []domain.Subscription `json:"subscriptions"`
 	Endpoints     []domain.Endpoint     `json:"endpoints"`
+	Settings      Settings              `json:"settings"`
 }
 
 type Store struct {
