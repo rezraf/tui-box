@@ -88,7 +88,7 @@ func TestReleasePublicationIsDraftAndAttestationGated(t *testing.T) {
 	if publish < 0 || publish != strings.LastIndex(workflow, "      - name: ") {
 		t.Fatal("publishing the attested release is not the final workflow step")
 	}
-	for _, required := range []string{"--json isDraft", `test "$release_is_draft" = true`, "gh api --method PATCH", "-F draft=false", "-F prerelease=false", "-f make_latest=true"} {
+	for _, required := range []string{"--json isDraft", `test "$release_is_draft" = true`, "gh release edit", "--draft=false", "--prerelease=false", "--latest"} {
 		if !strings.Contains(workflow, required) {
 			t.Errorf("release workflow is missing atomic publication guard %q", required)
 		}
