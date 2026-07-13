@@ -1,0 +1,71 @@
+{
+  "log": {
+    "disabled": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "type": "udp",
+        "tag": "tuibox-dns",
+        "server": "1.1.1.1",
+        "server_port": 53,
+        "detour": "tuibox-direct"
+      }
+    ],
+    "final": "tuibox-dns",
+    "strategy": "prefer_ipv4"
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "tuibox-inbound",
+      "listen": "127.0.0.1",
+      "listen_port": 2080
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "tuibox-proxy",
+      "server": "proxy.example.com",
+      "server_port": 443,
+      "uuid": "11111111-1111-4111-8111-111111111111",
+      "tls": {
+        "enabled": true,
+        "server_name": "proxy.example.com"
+      }
+    },
+    {
+      "type": "direct",
+      "tag": "tuibox-direct"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "protocol": "dns",
+        "action": "hijack-dns"
+      },
+      {
+        "ip_is_private": true,
+        "action": "route",
+        "outbound": "tuibox-direct"
+      },
+      {
+        "domain_suffix": [
+          ".lan",
+          ".local",
+          ".localhost"
+        ],
+        "action": "route",
+        "outbound": "tuibox-direct"
+      }
+    ],
+    "final": "tuibox-proxy",
+    "auto_detect_interface": true,
+    "default_domain_resolver": {
+      "server": "tuibox-dns",
+      "strategy": "prefer_ipv4"
+    }
+  }
+}

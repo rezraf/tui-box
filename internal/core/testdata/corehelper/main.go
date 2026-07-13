@@ -11,8 +11,11 @@ import (
 const outputBytes = 128 * 1024
 
 func main() {
-	if len(os.Args) != 4 || os.Args[2] != "-c" {
+	if len(os.Args) != 4 || os.Args[2] != "-c" || os.Args[3] != "/dev/fd/3" {
 		os.Exit(64)
+	}
+	if len(os.Environ()) != 0 {
+		os.Exit(65)
 	}
 	config, err := os.ReadFile(os.Args[3])
 	if err != nil {
@@ -30,7 +33,7 @@ func main() {
 	case "run":
 		signals := make(chan os.Signal, 1)
 		signal.Notify(signals, syscall.SIGTERM, syscall.SIGINT)
-		_, _ = os.Stdout.Write([]byte("ready\n"))
+		_, _ = fmt.Fprintf(os.Stdout, "uid=%d gid=%d config-readable\n", os.Geteuid(), os.Getegid())
 		_, _ = os.Stdout.Write(bytes.Repeat([]byte("x"), outputBytes))
 		<-signals
 	default:

@@ -9,7 +9,6 @@ import (
 	"syscall"
 
 	"github.com/rezraf/tui-box/internal/domain"
-	"golang.org/x/sys/unix"
 )
 
 func configureCommand(command *exec.Cmd, operation string, request ConnectionRequest) {
@@ -32,25 +31,10 @@ func signalProcessGroup(pid int, signal syscall.Signal) error {
 	return err
 }
 
-func openSecureConfig(path string, write bool) (*os.File, error) {
-	flags := unix.O_CLOEXEC | unix.O_NOFOLLOW
-	if write {
-		flags |= unix.O_WRONLY
-	} else {
-		flags |= unix.O_RDONLY
+func fileOwnerID(info os.FileInfo) (int, bool) {
+	status, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, false
 	}
-	fileDescriptor, err := unix.Open(path, flags, 0)
-	if err != nil {
-		return nil, err
-	}
-	file := os.NewFile(uintptr(fileDescriptor), path)
-	info, err := file.Stat()
-	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
-		_ = file.Close()
-		if err != nil {
-			return nil, err
-		}
-		return nil, ErrUnsafeConfigPath
-	}
-	return file, nil
+	return int(status.Uid), true
 }

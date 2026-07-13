@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"net/netip"
+	"strings"
 
 	"github.com/rezraf/tui-box/internal/domain"
 )
@@ -19,14 +21,20 @@ const (
 	tunInterfaceName   = "tuibox0"
 	tunAddress         = "172.19.0.1/30"
 	dnsServerAddress   = "1.1.1.1"
+
+	maxRuleDirectDomainSuffixes = 64
+	maxRuleDirectCIDRs          = 64
+	maxDomainSuffixBytes        = 253
 )
 
 type ConnectionRequest struct {
-	Mode     domain.ConnectionMode
-	Route    domain.RouteMode
-	Endpoint *domain.Endpoint
-	UID      int
-	GID      int
+	Mode                     domain.ConnectionMode
+	Route                    domain.RouteMode
+	Endpoint                 *domain.Endpoint
+	UID                      int
+	GID                      int
+	RuleDirectDomainSuffixes []string
+	RuleDirectCIDRs          []netip.Prefix
 }
 
 func GenerateConfig(request ConnectionRequest) ([]byte, error) {
@@ -39,7 +47,7 @@ func GenerateConfig(request ConnectionRequest) ([]byte, error) {
 		DNS:       fixedDNSOptions(),
 		Inbounds:  []inbound{buildInbound(request.Mode)},
 		Outbounds: []outbound{{Type: "direct", Tag: directOutboundTag}},
-		Route:     fixedRouteOptions(request.Route),
+		Route:     fixedRouteOptions(request),
 	}
 	if request.Route != domain.RouteModeDirect {
 		proxy := mapEndpoint(*request.Endpoint)
@@ -76,6 +84,9 @@ func (request ConnectionRequest) validate() error {
 	if request.Mode == domain.ConnectionModeProxy && request.GID == 0 {
 		return fmt.Errorf("proxy GID must be non-root")
 	}
+	if err := request.validateRuleDirectFields(); err != nil {
+		return err
+	}
 	if request.Endpoint == nil {
 		if request.Route == domain.RouteModeDirect {
 			return nil
@@ -93,6 +104,66 @@ func validateIdentity(name string, value int) error {
 		return fmt.Errorf("%s is invalid", name)
 	}
 	return nil
+}
+
+func (request ConnectionRequest) validateRuleDirectFields() error {
+	if request.Route != domain.RouteModeRule {
+		if len(request.RuleDirectDomainSuffixes) != 0 || len(request.RuleDirectCIDRs) != 0 {
+			return fmt.Errorf("direct rule fields require Rule route mode")
+		}
+		return nil
+	}
+	if len(request.RuleDirectDomainSuffixes) > maxRuleDirectDomainSuffixes {
+		return fmt.Errorf("too many direct domain suffixes")
+	}
+	if len(request.RuleDirectCIDRs) > maxRuleDirectCIDRs {
+		return fmt.Errorf("too many direct CIDRs")
+	}
+
+	seenDomains := make(map[string]struct{}, len(request.RuleDirectDomainSuffixes))
+	for _, suffix := range request.RuleDirectDomainSuffixes {
+		normalized := strings.ToLower(suffix)
+		if !validDomainSuffix(suffix) {
+			return fmt.Errorf("invalid direct domain suffix")
+		}
+		if _, exists := seenDomains[normalized]; exists {
+			return fmt.Errorf("duplicate direct domain suffix")
+		}
+		seenDomains[normalized] = struct{}{}
+	}
+
+	seenCIDRs := make(map[netip.Prefix]struct{}, len(request.RuleDirectCIDRs))
+	for _, prefix := range request.RuleDirectCIDRs {
+		if !prefix.IsValid() || prefix != prefix.Masked() {
+			return fmt.Errorf("invalid direct CIDR")
+		}
+		if _, exists := seenCIDRs[prefix]; exists {
+			return fmt.Errorf("duplicate direct CIDR")
+		}
+		seenCIDRs[prefix] = struct{}{}
+	}
+	return nil
+}
+
+func validDomainSuffix(value string) bool {
+	if value == "" || len(value) > maxDomainSuffixBytes || value != strings.TrimSpace(value) || strings.HasPrefix(value, ".") || strings.HasSuffix(value, ".") {
+		return false
+	}
+	if _, err := netip.ParseAddr(value); err == nil {
+		return false
+	}
+	for _, label := range strings.Split(value, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, character := range label {
+			if character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' || character >= '0' && character <= '9' || character == '-' {
+				continue
+			}
+			return false
+		}
+	}
+	return true
 }
 
 type singBoxConfig struct {
@@ -181,21 +252,37 @@ type routeRule struct {
 	Protocol     string   `json:"protocol,omitempty"`
 	IPIsPrivate  bool     `json:"ip_is_private,omitempty"`
 	DomainSuffix []string `json:"domain_suffix,omitempty"`
+	IPCIDR       []string `json:"ip_cidr,omitempty"`
 	Action       string   `json:"action"`
 	Outbound     string   `json:"outbound,omitempty"`
 }
 
-func fixedRouteOptions(route domain.RouteMode) routeOptions {
+func fixedRouteOptions(request ConnectionRequest) routeOptions {
 	final := proxyOutboundTag
-	if route == domain.RouteModeDirect {
+	if request.Route == domain.RouteModeDirect {
 		final = directOutboundTag
 	}
+	rules := []routeRule{
+		{Protocol: "dns", Action: "hijack-dns"},
+		{IPIsPrivate: true, Action: "route", Outbound: directOutboundTag},
+		{DomainSuffix: []string{".lan", ".local", ".localhost"}, Action: "route", Outbound: directOutboundTag},
+	}
+	if len(request.RuleDirectDomainSuffixes) != 0 {
+		suffixes := make([]string, len(request.RuleDirectDomainSuffixes))
+		for index, suffix := range request.RuleDirectDomainSuffixes {
+			suffixes[index] = strings.ToLower(suffix)
+		}
+		rules = append(rules, routeRule{DomainSuffix: suffixes, Action: "route", Outbound: directOutboundTag})
+	}
+	if len(request.RuleDirectCIDRs) != 0 {
+		prefixes := make([]string, len(request.RuleDirectCIDRs))
+		for index, prefix := range request.RuleDirectCIDRs {
+			prefixes[index] = prefix.String()
+		}
+		rules = append(rules, routeRule{IPCIDR: prefixes, Action: "route", Outbound: directOutboundTag})
+	}
 	return routeOptions{
-		Rules: []routeRule{
-			{Protocol: "dns", Action: "hijack-dns"},
-			{IPIsPrivate: true, Action: "route", Outbound: directOutboundTag},
-			{DomainSuffix: []string{".lan", ".local", ".localhost"}, Action: "route", Outbound: directOutboundTag},
-		},
+		Rules:               rules,
 		Final:               final,
 		AutoDetectInterface: true,
 		DefaultDomainResolver: domainResolverOptions{

@@ -3,6 +3,7 @@ package core
 import (
 	"bytes"
 	"encoding/json"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,39 +12,37 @@ import (
 	"github.com/rezraf/tui-box/internal/domain"
 )
 
-func TestGenerateConfigMatchesGoldens(t *testing.T) {
+func TestGenerateConfigMatchesCompleteModeRouteGoldens(t *testing.T) {
 	t.Parallel()
 
-	tests := []struct {
-		name    string
-		request ConnectionRequest
-		golden  string
-	}{
-		{
-			name:    "proxy direct",
-			request: ConnectionRequest{Mode: domain.ConnectionModeProxy, Route: domain.RouteModeDirect, UID: 501, GID: 20},
-			golden:  "proxy-direct.json",
-		},
-		{
-			name:    "TUN global",
-			request: validConnectionRequest(domain.ConnectionModeTUN, domain.RouteModeGlobal),
-			golden:  "tun-global.json",
-		},
-	}
+	for _, mode := range []domain.ConnectionMode{domain.ConnectionModeProxy, domain.ConnectionModeTUN} {
+		for _, route := range []domain.RouteMode{domain.RouteModeGlobal, domain.RouteModeRule, domain.RouteModeDirect} {
+			mode, route := mode, route
+			t.Run(string(mode)+"/"+string(route), func(t *testing.T) {
+				t.Parallel()
+				request := validConnectionRequest(mode, route)
+				if route == domain.RouteModeDirect {
+					request.Endpoint = nil
+				}
+				if route == domain.RouteModeRule {
+					request.RuleDirectDomainSuffixes = []string{"Example.COM", "internal.example"}
+					request.RuleDirectCIDRs = []netip.Prefix{
+						netip.MustParsePrefix("192.0.2.0/24"),
+						netip.MustParsePrefix("2001:db8::/32"),
+					}
+				}
 
-	for _, test := range tests {
-		test := test
-		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
-			want, err := os.ReadFile(filepath.Join("testdata", "golden", test.golden))
-			if err != nil {
-				t.Fatal(err)
-			}
-			got := generateConfig(t, test.request)
-			if !bytes.Equal(got, want) {
-				t.Fatalf("generated config does not match %s\ngot:\n%s\nwant:\n%s", test.golden, got, want)
-			}
-		})
+				golden := string(mode) + "-" + string(route) + ".json"
+				want, err := os.ReadFile(filepath.Join("testdata", "golden", golden))
+				if err != nil {
+					t.Fatal(err)
+				}
+				got := generateConfig(t, request)
+				if !bytes.Equal(got, want) {
+					t.Fatalf("generated config does not match %s\ngot:\n%s\nwant:\n%s", golden, got, want)
+				}
+			})
+		}
 	}
 }
 
@@ -143,6 +142,171 @@ func TestGenerateConfigMapsRouteModesAndFixedDNS(t *testing.T) {
 				t.Errorf("DNS server = %#v, want fixed direct resolver", server)
 			}
 		})
+	}
+}
+
+func TestGenerateConfigEmitsDistinctRuleModeDirectRules(t *testing.T) {
+	t.Parallel()
+
+	request := validConnectionRequest(domain.ConnectionModeProxy, domain.RouteModeRule)
+	request.RuleDirectDomainSuffixes = []string{"Example.COM", "internal.example"}
+	request.RuleDirectCIDRs = []netip.Prefix{
+		netip.MustParsePrefix("192.0.2.0/24"),
+		netip.MustParsePrefix("2001:db8::/32"),
+	}
+
+	config := decodeConfig(t, generateConfig(t, request))
+	rules := config["route"].(map[string]any)["rules"].([]any)
+	var domainRule, cidrRule map[string]any
+	for _, raw := range rules {
+		rule := raw.(map[string]any)
+		if _, ok := rule["domain_suffix"]; ok {
+			if suffixes := rule["domain_suffix"].([]any); len(suffixes) == 2 {
+				domainRule = rule
+			}
+		}
+		if _, ok := rule["ip_cidr"]; ok {
+			cidrRule = rule
+		}
+	}
+	if domainRule == nil || cidrRule == nil {
+		t.Fatalf("custom Rule routes are missing: %#v", rules)
+	}
+	if !valuesEqual(domainRule["domain_suffix"], []any{"example.com", "internal.example"}) {
+		t.Errorf("domain suffixes = %#v", domainRule["domain_suffix"])
+	}
+	if _, mixed := domainRule["ip_cidr"]; mixed {
+		t.Fatal("domain and CIDR values must be emitted as distinct rules")
+	}
+	if !valuesEqual(cidrRule["ip_cidr"], []any{"192.0.2.0/24", "2001:db8::/32"}) {
+		t.Errorf("CIDRs = %#v", cidrRule["ip_cidr"])
+	}
+	if _, mixed := cidrRule["domain_suffix"]; mixed {
+		t.Fatal("CIDR and domain values must be emitted as distinct rules")
+	}
+}
+
+func TestGenerateConfigRejectsInvalidRuleModeDirectFields(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		mutate func(*ConnectionRequest)
+	}{
+		{
+			name: "domains outside Rule mode",
+			mutate: func(request *ConnectionRequest) {
+				request.Route = domain.RouteModeGlobal
+				request.RuleDirectDomainSuffixes = []string{"example.com"}
+			},
+		},
+		{
+			name: "CIDRs outside Rule mode",
+			mutate: func(request *ConnectionRequest) {
+				request.Route = domain.RouteModeDirect
+				request.Endpoint = nil
+				request.RuleDirectCIDRs = []netip.Prefix{netip.MustParsePrefix("192.0.2.0/24")}
+			},
+		},
+		{
+			name: "too many domains",
+			mutate: func(request *ConnectionRequest) {
+				request.RuleDirectDomainSuffixes = make([]string, maxRuleDirectDomainSuffixes+1)
+				for i := range request.RuleDirectDomainSuffixes {
+					request.RuleDirectDomainSuffixes[i] = "example.com"
+				}
+			},
+		},
+		{
+			name: "too many CIDRs",
+			mutate: func(request *ConnectionRequest) {
+				request.RuleDirectCIDRs = make([]netip.Prefix, maxRuleDirectCIDRs+1)
+				for i := range request.RuleDirectCIDRs {
+					request.RuleDirectCIDRs[i] = netip.MustParsePrefix("192.0.2.0/24")
+				}
+			},
+		},
+		{
+			name: "empty domain",
+			mutate: func(request *ConnectionRequest) {
+				request.RuleDirectDomainSuffixes = []string{""}
+			},
+		},
+		{
+			name: "domain whitespace",
+			mutate: func(request *ConnectionRequest) {
+				request.RuleDirectDomainSuffixes = []string{" example.com"}
+			},
+		},
+		{
+			name: "domain leading dot",
+			mutate: func(request *ConnectionRequest) {
+				request.RuleDirectDomainSuffixes = []string{".example.com"}
+			},
+		},
+		{
+			name: "domain empty label",
+			mutate: func(request *ConnectionRequest) {
+				request.RuleDirectDomainSuffixes = []string{"example..com"}
+			},
+		},
+		{
+			name: "domain IP literal",
+			mutate: func(request *ConnectionRequest) {
+				request.RuleDirectDomainSuffixes = []string{"192.0.2.1"}
+			},
+		},
+		{
+			name: "duplicate normalized domain",
+			mutate: func(request *ConnectionRequest) {
+				request.RuleDirectDomainSuffixes = []string{"example.com", "Example.COM"}
+			},
+		},
+		{
+			name: "invalid prefix",
+			mutate: func(request *ConnectionRequest) {
+				request.RuleDirectCIDRs = []netip.Prefix{{}}
+			},
+		},
+		{
+			name: "noncanonical prefix",
+			mutate: func(request *ConnectionRequest) {
+				request.RuleDirectCIDRs = []netip.Prefix{netip.MustParsePrefix("192.0.2.1/24")}
+			},
+		},
+		{
+			name: "duplicate prefix",
+			mutate: func(request *ConnectionRequest) {
+				prefix := netip.MustParsePrefix("192.0.2.0/24")
+				request.RuleDirectCIDRs = []netip.Prefix{prefix, prefix}
+			},
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			request := validConnectionRequest(domain.ConnectionModeProxy, domain.RouteModeRule)
+			test.mutate(&request)
+			if output, err := GenerateConfig(request); output != nil || err == nil {
+				t.Fatalf("GenerateConfig() = %q, %v, want rejection", output, err)
+			}
+		})
+	}
+}
+
+func TestGenerateConfigGlobalDoesNotEmitRuleModeDirectFields(t *testing.T) {
+	t.Parallel()
+
+	request := validConnectionRequest(domain.ConnectionModeProxy, domain.RouteModeGlobal)
+	config := decodeConfig(t, generateConfig(t, request))
+	encoded, err := json.Marshal(config["route"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(encoded, []byte("example.com")) || bytes.Contains(encoded, []byte("192.0.2.0/24")) {
+		t.Fatalf("Global route contains Rule-only values: %s", encoded)
 	}
 }
 
