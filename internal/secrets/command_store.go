@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os/exec"
 	"strings"
+	"sync"
 )
 
 const (
@@ -60,9 +61,11 @@ const (
 )
 
 type commandStore struct {
+	lifecycle  sync.RWMutex
 	backend    commandBackend
 	executable string
 	runner     CommandRunner
+	closed     bool
 }
 
 func newMacOSKeychainStore(runner CommandRunner) Store {
@@ -78,6 +81,11 @@ func newCommandStore(backend commandBackend, executable string, runner CommandRu
 }
 
 func (store *commandStore) Get(ctx context.Context, key string) (string, error) {
+	if err := store.beginOperation(); err != nil {
+		return "", err
+	}
+	defer store.endOperation()
+
 	if !validSecretKey(key) {
 		return "", errors.New("secret key is invalid")
 	}
@@ -95,6 +103,11 @@ func (store *commandStore) Get(ctx context.Context, key string) (string, error) 
 }
 
 func (store *commandStore) Set(ctx context.Context, key, secret string) error {
+	if err := store.beginOperation(); err != nil {
+		return err
+	}
+	defer store.endOperation()
+
 	if !validSecretKey(key) {
 		return errors.New("secret key is invalid")
 	}
@@ -109,6 +122,11 @@ func (store *commandStore) Set(ctx context.Context, key, secret string) error {
 }
 
 func (store *commandStore) Delete(ctx context.Context, key string) error {
+	if err := store.beginOperation(); err != nil {
+		return err
+	}
+	defer store.endOperation()
+
 	if !validSecretKey(key) {
 		return errors.New("secret key is invalid")
 	}
@@ -126,7 +144,26 @@ func (store *commandStore) Delete(ctx context.Context, key string) error {
 }
 
 func (store *commandStore) Close() error {
+	store.lifecycle.Lock()
+	defer store.lifecycle.Unlock()
+	if store.closed {
+		return nil
+	}
+	store.closed = true
 	return nil
+}
+
+func (store *commandStore) beginOperation() error {
+	store.lifecycle.RLock()
+	if store.closed {
+		store.lifecycle.RUnlock()
+		return ErrSecretStoreClosed
+	}
+	return nil
+}
+
+func (store *commandStore) endOperation() {
+	store.lifecycle.RUnlock()
 }
 
 func (store *commandStore) isNotFound(result CommandResult) bool {

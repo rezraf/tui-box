@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestMacOSKeychainInvokesSecurityWithSafeArguments(t *testing.T) {
@@ -225,18 +226,87 @@ func TestCommandStoreRejectsUnsafeKeysBeforeExecution(t *testing.T) {
 	}
 }
 
-func TestCommandStoreCloseIsNoOp(t *testing.T) {
-	runner := &recordingRunner{result: CommandResult{Stdout: []byte("secret\n")}}
+func TestCommandStoreCloseWaitsForInFlightCommand(t *testing.T) {
+	runner := &blockingRunner{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+		result:  CommandResult{Stdout: []byte("secret\n")},
+	}
 	store := newLinuxSecretServiceStore("/usr/bin/secret-tool", runner)
+
+	commandDone := make(chan error, 1)
+	go func() {
+		_, err := store.Get(context.Background(), "subscription-1")
+		commandDone <- err
+	}()
+	<-runner.started
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- store.Close() }()
+	select {
+	case err := <-closeDone:
+		close(runner.release)
+		<-commandDone
+		t.Fatalf("Close() returned before the in-flight command completed: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	close(runner.release)
+	if err := <-commandDone; err != nil {
+		t.Fatalf("Get() returned an unexpected error: %v", err)
+	}
+	if err := <-closeDone; err != nil {
+		t.Fatalf("Close() returned an unexpected error: %v", err)
+	}
+}
+
+func TestCommandStoreCloseIsIdempotent(t *testing.T) {
+	store := newLinuxSecretServiceStore("/usr/bin/secret-tool", &recordingRunner{})
 	if err := store.Close(); err != nil {
 		t.Fatalf("Close() returned an unexpected error: %v", err)
 	}
 	if err := store.Close(); err != nil {
 		t.Fatalf("second Close() returned an unexpected error: %v", err)
 	}
-	if value, err := store.Get(context.Background(), "subscription-1"); err != nil || value != "secret" {
-		t.Fatalf("Get() after no-op Close() = (%q, %v), want command store to remain usable", value, err)
+}
+
+func TestCommandStoreOperationsAfterCloseReturnStableErrorWithoutInvokingRunner(t *testing.T) {
+	runner := &recordingRunner{result: CommandResult{Stdout: []byte("secret\n")}}
+	store := newLinuxSecretServiceStore("/usr/bin/secret-tool", runner)
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close() returned an unexpected error: %v", err)
 	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	operations := []struct {
+		name string
+		run  func() error
+	}{
+		{name: "Get", run: func() error { _, err := store.Get(ctx, "subscription-1"); return err }},
+		{name: "Set", run: func() error { return store.Set(ctx, "subscription-1", "secret") }},
+		{name: "Delete", run: func() error { return store.Delete(ctx, "subscription-1") }},
+	}
+	for _, operation := range operations {
+		if err := operation.run(); err != ErrSecretStoreClosed {
+			t.Errorf("%s() error = %v, want stable ErrSecretStoreClosed", operation.name, err)
+		}
+	}
+	if commands := runner.commands(); len(commands) != 0 {
+		t.Fatalf("runner was invoked %d times after Close(), want 0", len(commands))
+	}
+}
+
+type blockingRunner struct {
+	started chan struct{}
+	release chan struct{}
+	result  CommandResult
+}
+
+func (runner *blockingRunner) Run(context.Context, string, []string, string) (CommandResult, error) {
+	close(runner.started)
+	<-runner.release
+	return runner.result, nil
 }
 
 type recordedCommand struct {
