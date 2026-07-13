@@ -16,6 +16,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/rezraf/tui-box/internal/domain"
 )
 
 const (
@@ -119,8 +121,12 @@ func inspectExecutable(input string) (string, os.FileInfo, error) {
 		return "", nil, ErrInvalidExecutable
 	}
 	owner, ok := fileOwnerID(info)
-	if !ok || owner != os.Geteuid() || info.Mode().Perm()&0o100 == 0 || info.Mode().Perm()&0o022 != 0 {
+	if !ok || owner != os.Geteuid() || info.Mode()&(os.ModeSetuid|os.ModeSetgid) != 0 ||
+		info.Mode().Perm()&0o100 == 0 || info.Mode().Perm()&0o022 != 0 {
 		return "", nil, ErrInvalidExecutable
+	}
+	if err := inspectExecutableCapabilities(resolved); err != nil {
+		return "", nil, err
 	}
 	if err := inspectTrustedParents(filepath.Dir(resolved)); err != nil {
 		return "", nil, err
@@ -143,6 +149,54 @@ func inspectTrustedParents(directory string) error {
 			return nil
 		}
 		directory = parent
+	}
+}
+
+func inspectExecutableAccessForIdentity(executable string, uid, gid int) error {
+	if !filepath.IsAbs(executable) || uid < 0 || gid < 0 {
+		return ErrInvalidExecutable
+	}
+
+	component := executable
+	isExecutable := true
+	for {
+		info, err := os.Lstat(component)
+		if err != nil || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o022 != 0 {
+			return ErrInvalidExecutable
+		}
+		if isExecutable {
+			if !info.Mode().IsRegular() {
+				return ErrInvalidExecutable
+			}
+		} else if !info.IsDir() {
+			return ErrInvalidExecutable
+		}
+		if !identityCanExecute(info, uid, gid) {
+			return ErrInvalidExecutable
+		}
+
+		parent := filepath.Dir(component)
+		if parent == component {
+			return nil
+		}
+		component = parent
+		isExecutable = false
+	}
+}
+
+func identityCanExecute(info os.FileInfo, uid, gid int) bool {
+	ownerUID, ownerGID, ok := fileIdentity(info)
+	if !ok {
+		return false
+	}
+	permissions := info.Mode().Perm()
+	switch {
+	case uid == ownerUID:
+		return permissions&0o100 != 0
+	case gid == ownerGID:
+		return permissions&0o010 != 0
+	default:
+		return permissions&0o001 != 0
 	}
 }
 
@@ -343,6 +397,11 @@ func (runner *execRunner) Start(ctx context.Context, prepared *PreparedConfig) (
 	}
 	if err := runner.inspectExecutable(); err != nil {
 		return nil, err
+	}
+	if state.request.Mode == domain.ConnectionModeProxy {
+		if err := inspectExecutableAccessForIdentity(runner.executable, state.request.UID, state.request.GID); err != nil {
+			return nil, err
+		}
 	}
 	config, digest, err := runner.readVerifiedConfig(state)
 	if err != nil {

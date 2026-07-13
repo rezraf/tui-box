@@ -32,10 +32,15 @@ func signalProcessGroup(pid int, signal syscall.Signal) error {
 	return err
 }
 
-func fileOwnerID(info os.FileInfo) (int, bool) {
+func fileIdentity(info os.FileInfo) (int, int, bool) {
 	status, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {
-		return 0, false
+		return 0, 0, false
 	}
-	return int(status.Uid), true
+	return int(status.Uid), int(status.Gid), true
+}
+
+func fileOwnerID(info os.FileInfo) (int, bool) {
+	uid, _, ok := fileIdentity(info)
+	return uid, ok
 }

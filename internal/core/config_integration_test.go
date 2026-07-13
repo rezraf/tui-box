@@ -7,9 +7,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -128,22 +130,281 @@ func TestGeneratedConfigsPassPinnedSingBoxCheckThroughRunnerNativeStdin(t *testi
 			}
 		}
 	}
-	if checks < 60 {
-		t.Fatalf("core-check matrix ran %d checks, want at least 60", checks)
+	if checks != 60 {
+		t.Fatalf("core-check matrix ran %d checks, want 60", checks)
 	}
+}
+
+func TestPinnedCoreIntegrationRequiresExplicitOptIn(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		executable string
+		optIn      string
+		want       bool
+	}{
+		{name: "ordinary test"},
+		{name: "unrecognized opt-in", optIn: "true"},
+		{name: "explicit opt-in", optIn: "1", want: true},
+		{name: "explicit executable", executable: "/trusted/sing-box", want: true},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if got := pinnedCoreIntegrationEnabled(test.executable, test.optIn); got != test.want {
+				t.Fatalf("pinnedCoreIntegrationEnabled(%q, %q) = %v, want %v", test.executable, test.optIn, got, test.want)
+			}
+		})
+	}
+}
+
+func pinnedCoreIntegrationEnabled(executable, optIn string) bool {
+	return executable != "" || optIn == "1"
 }
 
 func pinnedCoreExecutable(t *testing.T) string {
 	t.Helper()
 	executable := os.Getenv("TUIBOX_SING_BOX")
+	if !pinnedCoreIntegrationEnabled(executable, os.Getenv("TUIBOX_CORE_INTEGRATION")) {
+		t.Skip("set TUIBOX_CORE_INTEGRATION=1 or TUIBOX_SING_BOX to run pinned core integration")
+	}
 	if executable == "" {
-		if testing.Short() {
-			t.Skip("pinned sing-box download disabled by -short")
-		}
 		executable = downloadPinnedCore(t)
 	}
-	assertPinnedCoreVersion(t, executable)
-	return executable
+	trustedPath, _, err := inspectExecutable(executable)
+	if err != nil || trustedPath != executable {
+		t.Fatalf("pinned sing-box executable is not trusted: %v", err)
+	}
+	assertPinnedCoreVersion(t, trustedPath)
+	return trustedPath
+}
+
+func TestVerifyCoreArchivePinsExactBytes(t *testing.T) {
+	t.Parallel()
+
+	content := []byte("pinned archive bytes")
+	digest := sha256.Sum256(content)
+	verified, err := verifyCoreArchive(content, hex.EncodeToString(digest[:]))
+	if err != nil {
+		t.Fatalf("verifyCoreArchive() rejected exact bytes: %v", err)
+	}
+	content[0] ^= 0xff
+	if got := verified.bytes; bytes.Equal(got, content) || string(got) != "pinned archive bytes" {
+		t.Fatalf("verified archive did not retain an immutable exact copy: %q", got)
+	}
+	if archive, err := verifyCoreArchive(content, hex.EncodeToString(digest[:])); archive.bytes != nil || err == nil {
+		t.Fatalf("verifyCoreArchive() accepted changed bytes: %#v, %v", archive, err)
+	}
+}
+
+func TestFetchCoreArchiveIsHTTPSBoundedAndVerified(t *testing.T) {
+	payload := []byte("official archive")
+	digest := sha256.Sum256(payload)
+	server := httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.(http.Flusher).Flush()
+		_, _ = response.Write(payload)
+	}))
+	defer server.Close()
+
+	artifact := coreArtifact{URL: server.URL, SHA256: hex.EncodeToString(digest[:])}
+	archive, err := fetchCoreArchiveWithClient(server.Client(), artifact, int64(len(payload)))
+	if err != nil {
+		t.Fatalf("fetchCoreArchiveWithClient() failed: %v", err)
+	}
+	if !bytes.Equal(archive.bytes, payload) {
+		t.Fatalf("fetched archive = %q, want exact response bytes", archive.bytes)
+	}
+
+	if archive, err := fetchCoreArchiveWithClient(server.Client(), artifact, int64(len(payload)-1)); archive.bytes != nil || err == nil {
+		t.Fatalf("oversized archive = %#v, %v, want rejection", archive, err)
+	}
+	artifact.SHA256 = strings.Repeat("0", sha256.Size*2)
+	if archive, err := fetchCoreArchiveWithClient(server.Client(), artifact, int64(len(payload))); archive.bytes != nil || err == nil {
+		t.Fatalf("checksum-mismatched archive = %#v, %v, want rejection", archive, err)
+	}
+	artifact.URL = "http://example.com/sing-box.tar.gz"
+	if archive, err := fetchCoreArchiveWithClient(server.Client(), artifact, int64(len(payload))); archive.bytes != nil || err == nil {
+		t.Fatalf("non-HTTPS archive = %#v, %v, want rejection", archive, err)
+	}
+
+	insecureServer := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		_, _ = response.Write(payload)
+	}))
+	defer insecureServer.Close()
+	redirectServer := httptest.NewTLSServer(http.RedirectHandler(insecureServer.URL, http.StatusFound))
+	defer redirectServer.Close()
+	artifact.URL = redirectServer.URL
+	artifact.SHA256 = hex.EncodeToString(digest[:])
+	if archive, err := fetchCoreArchiveWithClient(redirectServer.Client(), artifact, int64(len(payload))); archive.bytes != nil || err == nil {
+		t.Fatalf("HTTPS downgrade archive = %#v, %v, want rejection", archive, err)
+	}
+}
+
+func TestExtractPinnedCoreWritesOnlyExpectedPrivateRegularFile(t *testing.T) {
+	t.Parallel()
+
+	body := []byte("exact sing-box executable")
+	archiveBytes := coreArchiveFixture(t,
+		coreArchiveMember{name: "sing-box-" + pinnedSingBoxVersion + "-darwin-arm64/", kind: tar.TypeDir},
+		coreArchiveMember{name: "sing-box-" + pinnedSingBoxVersion + "-darwin-arm64/LICENSE", kind: tar.TypeReg, body: []byte("license")},
+		coreArchiveMember{name: "sing-box-" + pinnedSingBoxVersion + "-darwin-arm64/sing-box", kind: tar.TypeReg, body: body},
+	)
+	archive := mustVerifyCoreArchive(t, archiveBytes)
+	destination := privateDirectory(t)
+	executable, err := extractPinnedCore(archive, destination, "darwin", "arm64")
+	if err != nil {
+		t.Fatalf("extractPinnedCore() failed: %v", err)
+	}
+	wantPath := filepath.Join(destination, "sing-box")
+	if executable != wantPath {
+		t.Fatalf("executable path = %q, want %q", executable, wantPath)
+	}
+	entries, err := os.ReadDir(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "sing-box" {
+		t.Fatalf("extracted entries = %#v, want only sing-box", entries)
+	}
+	got, err := os.ReadFile(executable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatalf("executable bytes = %q, want %q", got, body)
+	}
+	info, err := os.Lstat(executable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm() != 0o700 {
+		t.Fatalf("executable mode = %v, want regular 0700", info.Mode())
+	}
+}
+
+func TestExtractPinnedCoreRejectsUnsafeMembersAndExistingPaths(t *testing.T) {
+	t.Parallel()
+
+	wanted := "sing-box-" + pinnedSingBoxVersion + "-linux-amd64/sing-box"
+	tests := []struct {
+		name        string
+		members     []coreArchiveMember
+		preexisting bool
+	}{
+		{
+			name: "path traversal",
+			members: []coreArchiveMember{
+				{name: "../sing-box", kind: tar.TypeReg, body: []byte("malicious")},
+				{name: wanted, kind: tar.TypeReg, body: []byte("expected")},
+			},
+		},
+		{
+			name: "expected symlink",
+			members: []coreArchiveMember{
+				{name: wanted, kind: tar.TypeSymlink, linkName: "/bin/sh"},
+			},
+		},
+		{
+			name: "duplicate expected member",
+			members: []coreArchiveMember{
+				{name: wanted, kind: tar.TypeReg, body: []byte("first")},
+				{name: wanted, kind: tar.TypeReg, body: []byte("second")},
+			},
+		},
+		{
+			name:        "preexisting destination symlink",
+			preexisting: true,
+			members: []coreArchiveMember{
+				{name: wanted, kind: tar.TypeReg, body: []byte("expected")},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			destination := privateDirectory(t)
+			outside := filepath.Join(privateDirectory(t), "outside")
+			if err := os.WriteFile(outside, []byte("unchanged"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if test.preexisting {
+				if err := os.Symlink(outside, filepath.Join(destination, "sing-box")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			archive := mustVerifyCoreArchive(t, coreArchiveFixture(t, test.members...))
+			if executable, err := extractPinnedCore(archive, destination, "linux", "amd64"); executable != "" || err == nil {
+				t.Fatalf("extractPinnedCore() = %q, %v, want rejection", executable, err)
+			}
+			outsideBytes, err := os.ReadFile(outside)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(outsideBytes) != "unchanged" {
+				t.Fatalf("outside file changed to %q", outsideBytes)
+			}
+			entry, err := os.Lstat(filepath.Join(destination, "sing-box"))
+			if test.preexisting {
+				if err != nil || entry.Mode()&os.ModeSymlink == 0 {
+					t.Fatalf("preexisting symlink was replaced: %v, %v", entry, err)
+				}
+			} else if !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("failed extraction left executable behind: %v, %v", entry, err)
+			}
+		})
+	}
+}
+
+type coreArchiveMember struct {
+	name     string
+	kind     byte
+	body     []byte
+	linkName string
+}
+
+func coreArchiveFixture(t *testing.T, members ...coreArchiveMember) []byte {
+	t.Helper()
+	var output bytes.Buffer
+	compressed := gzip.NewWriter(&output)
+	archive := tar.NewWriter(compressed)
+	for _, member := range members {
+		header := &tar.Header{
+			Name:     member.name,
+			Mode:     0o777,
+			Size:     int64(len(member.body)),
+			Typeflag: member.kind,
+			Linkname: member.linkName,
+		}
+		if err := archive.WriteHeader(header); err != nil {
+			t.Fatal(err)
+		}
+		if len(member.body) > 0 {
+			if _, err := archive.Write(member.body); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := archive.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := compressed.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return output.Bytes()
+}
+
+func mustVerifyCoreArchive(t *testing.T, content []byte) verifiedCoreArchive {
+	t.Helper()
+	digest := sha256.Sum256(content)
+	archive, err := verifyCoreArchive(content, hex.EncodeToString(digest[:]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return archive
 }
 
 func runPinnedCoreStdinCheck(executable, directory string, config []byte) (string, error) {
@@ -158,6 +419,20 @@ func runPinnedCoreStdinCheck(executable, directory string, config []byte) (strin
 	return string(output.Bytes()), err
 }
 
+type verifiedCoreArchive struct {
+	bytes  []byte
+	digest [sha256.Size]byte
+}
+
+func verifyCoreArchive(content []byte, expected string) (verifiedCoreArchive, error) {
+	exactBytes := append([]byte(nil), content...)
+	digest := sha256.Sum256(exactBytes)
+	if hex.EncodeToString(digest[:]) != expected {
+		return verifiedCoreArchive{}, fmt.Errorf("SHA-256 mismatch")
+	}
+	return verifiedCoreArchive{bytes: exactBytes, digest: digest}, nil
+}
+
 func downloadPinnedCore(t *testing.T) string {
 	t.Helper()
 	target := runtime.GOOS + "/" + runtime.GOARCH
@@ -166,118 +441,137 @@ func downloadPinnedCore(t *testing.T) string {
 		t.Skipf("no pinned sing-box artifact for %s", target)
 	}
 
-	cacheRoot, err := os.UserCacheDir()
+	archive, err := fetchCoreArchive(artifact)
 	if err != nil {
-		cacheRoot = os.TempDir()
+		t.Fatalf("download pinned sing-box: %v", err)
 	}
-	cacheDirectory := filepath.Join(cacheRoot, "tuibox", "core-test", pinnedSingBoxVersion)
-	if err := os.MkdirAll(cacheDirectory, 0o700); err != nil {
-		t.Fatalf("create core cache: %v", err)
-	}
-	if err := os.Chmod(cacheDirectory, 0o700); err != nil {
-		t.Fatalf("secure core cache: %v", err)
-	}
-	archivePath := filepath.Join(cacheDirectory, filepath.Base(artifact.URL))
-	if err := verifyFileSHA256(archivePath, artifact.SHA256); err != nil {
-		if err := fetchCoreArchive(archivePath, artifact); err != nil {
-			t.Fatalf("download pinned sing-box: %v", err)
-		}
-	}
-
-	extractDirectory, err := os.MkdirTemp(cacheDirectory, ".extract-*")
-	if err != nil {
-		t.Fatalf("create core extraction directory: %v", err)
-	}
-	if err := os.Chmod(extractDirectory, 0o700); err != nil {
-		os.RemoveAll(extractDirectory)
-		t.Fatalf("secure core extraction directory: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := os.RemoveAll(extractDirectory); err != nil {
-			t.Errorf("remove core extraction directory: %v", err)
-		}
-	})
-	executable, err := extractPinnedCore(archivePath, extractDirectory, runtime.GOOS, runtime.GOARCH)
+	extractDirectory := privateCoreIntegrationDirectory(t)
+	executable, err := extractPinnedCore(archive, extractDirectory, runtime.GOOS, runtime.GOARCH)
 	if err != nil {
 		t.Fatalf("extract pinned sing-box: %v", err)
 	}
 	return executable
 }
 
-func fetchCoreArchive(destination string, artifact coreArtifact) error {
+func privateCoreIntegrationDirectory(t *testing.T) string {
+	t.Helper()
+	directory := t.TempDir()
+	if err := validatePrivateCoreIntegrationDirectory(directory); err == nil {
+		return directory
+	}
+
+	base, err := os.Getwd()
+	if err != nil || !filepath.IsAbs(base) {
+		t.Fatalf("locate trusted temporary base: %v", err)
+	}
+	if err := inspectTrustedParents(base); err != nil {
+		t.Fatalf("test working directory is not trusted: %v", err)
+	}
+	directory, err = os.MkdirTemp(base, ".tuibox-core-integration-*")
+	if err != nil {
+		t.Fatalf("create private core directory: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(directory); err != nil {
+			t.Errorf("remove private core directory: %v", err)
+		}
+	})
+	if err := validatePrivateCoreIntegrationDirectory(directory); err != nil {
+		t.Fatalf("private core directory is invalid: %v", err)
+	}
+	return directory
+}
+
+func validatePrivateCoreIntegrationDirectory(directory string) error {
+	if err := os.Chmod(directory, 0o700); err != nil {
+		return err
+	}
+	info, err := os.Lstat(directory)
+	if err != nil || !validRuntimeRootInfo(info) {
+		return ErrInvalidExecutable
+	}
+	return inspectTrustedParents(directory)
+}
+
+func fetchCoreArchive(artifact coreArtifact) (verifiedCoreArchive, error) {
+	return fetchCoreArchiveWithClient(&http.Client{}, artifact, maxCoreArchiveBytes)
+}
+
+func fetchCoreArchiveWithClient(client *http.Client, artifact coreArtifact, limit int64) (verifiedCoreArchive, error) {
+	if client == nil || limit < 1 || limit > maxCoreArchiveBytes {
+		return verifiedCoreArchive{}, fmt.Errorf("invalid core archive request")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, artifact.URL, nil)
 	if err != nil {
-		return err
+		return verifiedCoreArchive{}, err
 	}
-	client := &http.Client{
-		Timeout: 2 * time.Minute,
-		CheckRedirect: func(request *http.Request, _ []*http.Request) error {
-			if request.URL.Scheme != "https" {
-				return fmt.Errorf("redirected outside HTTPS")
-			}
-			return nil
-		},
+	if request.URL.Scheme != "https" {
+		return verifiedCoreArchive{}, fmt.Errorf("core archive URL must use HTTPS")
 	}
-	response, err := client.Do(request)
+
+	boundedClient := *client
+	boundedClient.Timeout = 2 * time.Minute
+	previousRedirectCheck := boundedClient.CheckRedirect
+	boundedClient.CheckRedirect = func(request *http.Request, via []*http.Request) error {
+		if request.URL.Scheme != "https" {
+			return fmt.Errorf("redirected outside HTTPS")
+		}
+		if previousRedirectCheck != nil {
+			return previousRedirectCheck(request, via)
+		}
+		if len(via) >= 10 {
+			return fmt.Errorf("too many redirects")
+		}
+		return nil
+	}
+	response, err := boundedClient.Do(request)
 	if err != nil {
-		return err
+		return verifiedCoreArchive{}, err
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected HTTP status %d", response.StatusCode)
+		return verifiedCoreArchive{}, fmt.Errorf("unexpected HTTP status %d", response.StatusCode)
 	}
-
-	temporary, err := os.CreateTemp(filepath.Dir(destination), ".sing-box-download-*")
+	if response.ContentLength > limit {
+		return verifiedCoreArchive{}, fmt.Errorf("core archive exceeds size limit")
+	}
+	content, err := io.ReadAll(io.LimitReader(response.Body, limit+1))
 	if err != nil {
-		return err
+		return verifiedCoreArchive{}, err
 	}
-	temporaryName := temporary.Name()
-	defer os.Remove(temporaryName)
-	if err := temporary.Chmod(0o600); err != nil {
-		temporary.Close()
-		return err
+	if int64(len(content)) > limit {
+		return verifiedCoreArchive{}, fmt.Errorf("core archive exceeds size limit")
 	}
-	written, copyErr := io.Copy(temporary, io.LimitReader(response.Body, maxCoreArchiveBytes+1))
-	syncErr := temporary.Sync()
-	closeErr := temporary.Close()
-	if copyErr != nil || syncErr != nil || closeErr != nil {
-		return fmt.Errorf("write core archive")
-	}
-	if written > maxCoreArchiveBytes {
-		return fmt.Errorf("core archive exceeds size limit")
-	}
-	if err := verifyFileSHA256(temporaryName, artifact.SHA256); err != nil {
-		return err
-	}
-	return os.Rename(temporaryName, destination)
+	return verifyCoreArchive(content, artifact.SHA256)
 }
 
-func verifyFileSHA256(name, expected string) error {
-	file, err := os.Open(name)
-	if err != nil {
-		return err
+func extractPinnedCore(archive verifiedCoreArchive, destination, goos, goarch string) (_ string, returnErr error) {
+	if sha256.Sum256(archive.bytes) != archive.digest {
+		return "", fmt.Errorf("verified core archive changed")
 	}
-	defer file.Close()
-	hash := sha256.New()
-	if _, err := io.Copy(hash, io.LimitReader(file, maxCoreArchiveBytes+1)); err != nil {
-		return err
+	before, err := os.Lstat(destination)
+	if err != nil || !validRuntimeRootInfo(before) {
+		return "", fmt.Errorf("invalid core extraction directory")
 	}
-	actual := hex.EncodeToString(hash.Sum(nil))
-	if actual != expected {
-		return fmt.Errorf("SHA-256 mismatch")
-	}
-	return nil
-}
-
-func extractPinnedCore(archivePath, destination, goos, goarch string) (string, error) {
-	archive, err := os.Open(archivePath)
+	root, err := os.OpenRoot(destination)
 	if err != nil {
 		return "", err
 	}
-	defer archive.Close()
-	compressed, err := gzip.NewReader(archive)
+	defer root.Close()
+	after, err := root.Stat(".")
+	if err != nil || !validRuntimeRootInfo(after) || !os.SameFile(before, after) {
+		return "", fmt.Errorf("core extraction directory changed")
+	}
+
+	created := false
+	defer func() {
+		if returnErr != nil && created {
+			_ = root.Remove("sing-box")
+		}
+	}()
+	compressed, err := gzip.NewReader(bytes.NewReader(archive.bytes))
 	if err != nil {
 		return "", err
 	}
@@ -286,7 +580,7 @@ func extractPinnedCore(archivePath, destination, goos, goarch string) (string, e
 	wanted := fmt.Sprintf("sing-box-%s-%s-%s/sing-box", pinnedSingBoxVersion, goos, goarch)
 	reader := tar.NewReader(compressed)
 	var total int64
-	var executable string
+	extracted := false
 	for {
 		header, err := reader.Next()
 		if err == io.EOF {
@@ -315,25 +609,39 @@ func extractPinnedCore(archivePath, destination, goos, goarch string) (string, e
 		if clean != wanted {
 			continue
 		}
-		if header.Typeflag != tar.TypeReg || executable != "" {
+		if header.Typeflag != tar.TypeReg || header.Size < 1 || extracted {
 			return "", fmt.Errorf("invalid core archive member")
 		}
-		executable = filepath.Join(destination, "sing-box")
-		output, err := os.OpenFile(executable, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o700)
+
+		output, err := root.OpenFile("sing-box", os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 		if err != nil {
 			return "", err
 		}
-		written, copyErr := io.Copy(output, io.LimitReader(reader, header.Size+1))
+		created = true
+		written, copyErr := io.CopyN(output, reader, header.Size)
+		var chmodErr error
+		if copyErr == nil && written == header.Size {
+			chmodErr = output.Chmod(0o700)
+		}
 		syncErr := output.Sync()
 		closeErr := output.Close()
-		if copyErr != nil || syncErr != nil || closeErr != nil || written != header.Size {
+		if chmodErr != nil || copyErr != nil || syncErr != nil || closeErr != nil || written != header.Size {
 			return "", fmt.Errorf("extract core executable")
 		}
+		extracted = true
 	}
-	if executable == "" {
+	if !extracted {
 		return "", fmt.Errorf("core executable missing from archive")
 	}
-	return executable, nil
+	info, err := root.Lstat("sing-box")
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o700 {
+		return "", fmt.Errorf("invalid extracted core executable")
+	}
+	owner, ok := fileOwnerID(info)
+	if !ok || owner != os.Geteuid() {
+		return "", fmt.Errorf("invalid extracted core executable owner")
+	}
+	return filepath.Join(destination, "sing-box"), nil
 }
 
 func assertPinnedCoreVersion(t *testing.T, executable string) {

@@ -52,6 +52,12 @@ func TestNewRunnerAcceptsOnlyTrustedExecutable(t *testing.T) {
 		{name: "not executable", path: func(t *testing.T) string {
 			return writeExecutable(t, directory, "not-executable", 0o600)
 		}},
+		{name: "setuid", path: func(t *testing.T) string {
+			return writeExecutable(t, directory, "setuid", 0o700|os.ModeSetuid)
+		}},
+		{name: "setgid", path: func(t *testing.T) string {
+			return writeExecutable(t, directory, "setgid", 0o700|os.ModeSetgid)
+		}},
 		{name: "group writable", path: func(t *testing.T) string {
 			return writeExecutable(t, directory, "group-writable", 0o770)
 		}},
@@ -483,6 +489,94 @@ func TestRunnerCheckAndStartAreContextAwareAndErrorsDoNotLeakSecrets(t *testing.
 	}
 }
 
+func TestIdentityCanExecuteUsesTheMatchingPermissionClass(t *testing.T) {
+	t.Parallel()
+
+	path := writeExecutable(t, trustedDirectory(t), "permission-core", 0o700)
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerUID, ownerGID, ok := fileIdentity(info)
+	if !ok {
+		t.Fatal("executable ownership is unavailable")
+	}
+	otherUID := differentIdentityID(ownerUID)
+	otherGID := differentIdentityID(ownerGID)
+
+	tests := []struct {
+		name string
+		mode os.FileMode
+		uid  int
+		gid  int
+		want bool
+	}{
+		{name: "owner execute", mode: 0o100, uid: ownerUID, gid: otherGID, want: true},
+		{name: "owner cannot borrow group execute", mode: 0o010, uid: ownerUID, gid: ownerGID},
+		{name: "matching group execute", mode: 0o010, uid: otherUID, gid: ownerGID, want: true},
+		{name: "group cannot borrow other execute", mode: 0o001, uid: otherUID, gid: ownerGID},
+		{name: "other execute", mode: 0o001, uid: otherUID, gid: otherGID, want: true},
+		{name: "other denied", mode: 0o100, uid: otherUID, gid: otherGID},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			if err := os.Chmod(path, test.mode); err != nil {
+				t.Fatal(err)
+			}
+			info, err := os.Stat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := identityCanExecute(info, test.uid, test.gid); got != test.want {
+				t.Fatalf("identityCanExecute(mode=%04o, uid=%d, gid=%d) = %v, want %v", test.mode, test.uid, test.gid, got, test.want)
+			}
+		})
+	}
+}
+
+func TestInspectExecutableAccessForIdentityChecksEveryPathComponent(t *testing.T) {
+	t.Parallel()
+
+	directory := trustedDirectory(t)
+	path := writeExecutable(t, directory, "access-core", 0o700)
+	uid, gid := os.Geteuid(), os.Getegid()
+	if err := inspectExecutableAccessForIdentity(path, uid, gid); err != nil {
+		t.Fatalf("accessible trusted executable rejected: %v", err)
+	}
+
+	if err := os.Chmod(path, 0o720); err != nil {
+		t.Fatal(err)
+	}
+	if err := inspectExecutableAccessForIdentity(path, uid, gid); !errors.Is(err, ErrInvalidExecutable) {
+		t.Fatalf("group-writable executable error = %v, want ErrInvalidExecutable", err)
+	}
+	if err := os.Chmod(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.Chmod(directory, 0o702); err != nil {
+		t.Fatal(err)
+	}
+	if err := inspectExecutableAccessForIdentity(path, uid, gid); !errors.Is(err, ErrInvalidExecutable) {
+		t.Fatalf("other-writable parent error = %v, want ErrInvalidExecutable", err)
+	}
+	if err := os.Chmod(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.Chmod(directory, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := inspectExecutableAccessForIdentity(path, uid, gid); !errors.Is(err, ErrInvalidExecutable) {
+		t.Fatalf("non-traversable parent error = %v, want ErrInvalidExecutable", err)
+	}
+	if err := os.Chmod(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestProxyCommandSkipsCredentialWhenIdentityAlreadyMatches(t *testing.T) {
 	t.Parallel()
 
@@ -505,7 +599,11 @@ func TestProxyExecutionAsOrdinaryUserConsumesExactGeneratedConfigFromStdin(t *te
 		uid, gid = 65534, 65534
 	}
 
-	runner, _ := newTestRunner(t, buildCoreHelper(t))
+	helper := buildCoreHelper(t)
+	if err := inspectExecutableAccessForIdentity(helper, uid, gid); err != nil {
+		t.Fatalf("test identity %d:%d cannot execute helper: %v", uid, gid, err)
+	}
+	runner, _ := newTestRunner(t, helper)
 	request := validConnectionRequest(domain.ConnectionModeProxy, domain.RouteModeGlobal)
 	request.UID = uid
 	request.GID = gid
@@ -529,12 +627,37 @@ func TestProxyExecutionAsOrdinaryUserConsumesExactGeneratedConfigFromStdin(t *te
 	}
 }
 
+func TestProxyStartRejects0700ExecutableInaccessibleToRequestedIdentity(t *testing.T) {
+	helper := buildCoreHelper(t)
+	if err := os.Chmod(helper, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runner, _ := newTestRunner(t, helper)
+	request := validConnectionRequest(domain.ConnectionModeProxy, domain.RouteModeGlobal)
+	request.UID = differentIdentityID(os.Geteuid())
+	request.GID = differentIdentityID(os.Getegid())
+	prepared, err := runner.Prepare(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.Check(context.Background(), prepared); err != nil {
+		t.Fatal(err)
+	}
+	if process, err := runner.Start(context.Background(), prepared); process != nil || !errors.Is(err, ErrInvalidExecutable) {
+		t.Fatalf("Start() = %#v, %v, want ErrInvalidExecutable", process, err)
+	}
+}
+
 func TestProxyExecutionDropsIdentityAndReadsRootOwnedConfigFromStdin(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("requires root to prove credential drop before stdin config read")
 	}
 
-	runner, runtimeDirectory := newTestRunner(t, buildCoreHelper(t))
+	helper := buildCoreHelper(t)
+	if err := inspectExecutableAccessForIdentity(helper, 65534, 65534); err != nil {
+		t.Fatalf("test identity cannot execute helper: %v", err)
+	}
+	runner, runtimeDirectory := newTestRunner(t, helper)
 	request := validConnectionRequest(domain.ConnectionModeProxy, domain.RouteModeGlobal)
 	request.UID = 65534
 	request.GID = 65534
@@ -683,6 +806,13 @@ func onlyRuntimeConfig(t *testing.T, runtimeDirectory string) string {
 
 func strconvIntSize() int {
 	return 32 << (^uint(0) >> 63)
+}
+
+func differentIdentityID(id int) int {
+	if id == 65534 {
+		return 65533
+	}
+	return 65534
 }
 
 func waitForOutput(t *testing.T, process Process, text string) {
