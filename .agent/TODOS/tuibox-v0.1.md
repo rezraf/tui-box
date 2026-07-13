@@ -20,5 +20,5 @@
   - Verify: `go run ./cmd/tuibox --help`, all subcommand help paths, `go test ./scripts -run 'TestDocumentation'`, and the placeholder/secret scans pass
 - [x] Complete adversarial security review and full verification
   - Verify: release-source and documentation validators, `go test -race ./...`, `go vet ./...`, `go build ./cmd/tuibox ./cmd/tuiboxd`, `./scripts/cross-build.sh`, and `git diff --check`
-- [ ] Remove local caches created by TuiBox development and verification
+- [x] Remove local caches created by TuiBox development and verification
   - Verify: TuiBox core-test cache and temporary build/release artifacts no longer exist; unrelated caches remain untouched
