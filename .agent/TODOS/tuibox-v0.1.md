@@ -8,7 +8,7 @@
   - Verify: `go test ./internal/subscription ./internal/secrets ./internal/state`
 - [x] Generate typed sing-box configs for both connection modes and three route modes
   - Verify: `go test ./internal/core`
-- [ ] Add peer-authenticated Unix RPC and daemon lifecycle
+- [x] Add peer-authenticated Unix RPC and daemon lifecycle
   - Verify: `go test ./internal/rpc ./internal/daemon`
 - [ ] Add refresh, latency, redaction, telemetry consent, and CLI services
   - Verify: `go test ./internal/app ./internal/latency ./internal/redact ./internal/telemetry ./internal/cli`
