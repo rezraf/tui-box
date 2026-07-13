@@ -3,9 +3,11 @@ package secrets
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -22,6 +24,7 @@ func TestFileStoreUsesRestrictedPermissionsAndPersistsValues(t *testing.T) {
 	}
 
 	assertFileMode(t, directory, 0o700)
+	assertFileMode(t, filepath.Join(directory, fallbackLockFileName), 0o600)
 	path := filepath.Join(directory, fallbackFileName)
 	assertFileMode(t, path, 0o600)
 
@@ -108,6 +111,83 @@ func TestFileStoreRefusesSymlinkFile(t *testing.T) {
 	}
 	if store != nil {
 		t.Fatal("newFileStore() returned a store for symlink file")
+	}
+}
+
+func TestIndependentFileStoresDoNotLoseConcurrentUpdates(t *testing.T) {
+	directory := filepath.Join(t.TempDir(), "secrets")
+	first, err := newFileStore(directory)
+	if err != nil {
+		t.Fatalf("first newFileStore() returned an unexpected error: %v", err)
+	}
+	second, err := newFileStore(directory)
+	if err != nil {
+		t.Fatalf("second newFileStore() returned an unexpected error: %v", err)
+	}
+
+	base := make(map[string]string, 500)
+	for index := 0; index < 500; index++ {
+		base[fmt.Sprintf("existing-%d", index)] = strings.Repeat("x", 128)
+	}
+	encoded, err := json.Marshal(base)
+	if err != nil {
+		t.Fatalf("json.Marshal(): %v", err)
+	}
+	path := filepath.Join(directory, fallbackFileName)
+
+	for attempt := 0; attempt < 25; attempt++ {
+		if err := os.WriteFile(path, encoded, 0o600); err != nil {
+			t.Fatalf("attempt %d reset WriteFile(): %v", attempt, err)
+		}
+		start := make(chan struct{})
+		errorsChannel := make(chan error, 2)
+		var waitGroup sync.WaitGroup
+		for _, operation := range []struct {
+			store *fileStore
+			key   string
+		}{
+			{store: first, key: "subscription-a"},
+			{store: second, key: "subscription-b"},
+		} {
+			operation := operation
+			waitGroup.Add(1)
+			go func() {
+				defer waitGroup.Done()
+				<-start
+				if err := operation.store.Set(context.Background(), operation.key, "secret"); err != nil {
+					errorsChannel <- err
+				}
+			}()
+		}
+		close(start)
+		waitGroup.Wait()
+		close(errorsChannel)
+		for err := range errorsChannel {
+			t.Fatalf("attempt %d concurrent Set() failed: %v", attempt, err)
+		}
+
+		for _, key := range []string{"subscription-a", "subscription-b"} {
+			if _, err := first.Get(context.Background(), key); err != nil {
+				t.Fatalf("attempt %d lost concurrent update %q: %v", attempt, key, err)
+			}
+		}
+	}
+}
+
+func TestFileStoreRefusesSymlinkedAncestor(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	target := filepath.Join(root, "target")
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatalf("Mkdir(): %v", err)
+	}
+	ancestor := filepath.Join(root, "ancestor")
+	if err := os.Symlink(target, ancestor); err != nil {
+		t.Fatalf("Symlink(): %v", err)
+	}
+	if _, err := newFileStore(filepath.Join(ancestor, "nested", "secrets")); err == nil {
+		t.Fatal("newFileStore() accepted a symlinked ancestor")
 	}
 }
 

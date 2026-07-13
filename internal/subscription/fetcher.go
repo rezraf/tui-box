@@ -34,7 +34,7 @@ func NewFetcher(client *http.Client) *Fetcher {
 		client = &http.Client{}
 	}
 	configured := *client
-	if configured.Timeout == 0 {
+	if configured.Timeout <= 0 || configured.Timeout > DefaultSubscriptionTimeout {
 		configured.Timeout = DefaultSubscriptionTimeout
 	}
 	configured.CheckRedirect = checkSubscriptionRedirect

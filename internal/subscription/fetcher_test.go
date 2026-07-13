@@ -155,12 +155,34 @@ func TestFetcherAcceptsResponseAtHardLimit(t *testing.T) {
 	}
 }
 
-func TestFetcherUsesDefaultAndConfigurableTimeouts(t *testing.T) {
+func TestFetcherClampsUnsafeTimeoutsAndPreservesShorterPositiveTimeouts(t *testing.T) {
 	t.Parallel()
 
-	if got := NewFetcher(nil).client.Timeout; got != DefaultSubscriptionTimeout {
-		t.Fatalf("default client timeout = %s, want %s", got, DefaultSubscriptionTimeout)
+	tests := []struct {
+		name   string
+		client *http.Client
+		want   time.Duration
+	}{
+		{name: "nil client", client: nil, want: DefaultSubscriptionTimeout},
+		{name: "zero", client: &http.Client{}, want: DefaultSubscriptionTimeout},
+		{name: "negative", client: &http.Client{Timeout: -time.Second}, want: DefaultSubscriptionTimeout},
+		{name: "short positive", client: &http.Client{Timeout: 25 * time.Millisecond}, want: 25 * time.Millisecond},
+		{name: "exact maximum", client: &http.Client{Timeout: DefaultSubscriptionTimeout}, want: DefaultSubscriptionTimeout},
+		{name: "above maximum", client: &http.Client{Timeout: DefaultSubscriptionTimeout + time.Millisecond}, want: DefaultSubscriptionTimeout},
 	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if got := NewFetcher(test.client).client.Timeout; got != test.want {
+				t.Fatalf("client timeout = %s, want %s", got, test.want)
+			}
+		})
+	}
+}
+
+func TestFetcherHonorsShortPositiveTimeout(t *testing.T) {
+	t.Parallel()
 
 	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		<-request.Context().Done()

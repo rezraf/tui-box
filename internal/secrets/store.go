@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os/exec"
 	"runtime"
+	"time"
 )
 
 const (
@@ -12,7 +13,8 @@ const (
 	BackendLinuxSecretService = "linux-secret-service"
 	BackendFile               = "file"
 
-	fallbackWarning = "OS credential storage is unavailable; subscription URLs are stored in a restricted local file"
+	fallbackWarning           = "OS credential storage is unavailable; subscription URLs are stored in a restricted local file"
+	nativeBackendProbeTimeout = 2 * time.Second
 )
 
 var ErrSecretNotFound = errors.New("secret was not found")
@@ -37,11 +39,11 @@ func Open(directory string) (Store, BackendInfo, error) {
 func newStore(goos, directory string, lookup executableLookup, runner CommandRunner) (Store, BackendInfo, error) {
 	switch goos {
 	case "darwin":
-		if executable, err := lookup(macOSSecurityExecutable); err == nil {
+		if executable, err := lookup(macOSSecurityExecutable); err == nil && probeNativeBackend(commandBackendMacOS, executable, runner) {
 			return newCommandStore(commandBackendMacOS, executable, runner), BackendInfo{Name: BackendMacOSKeychain}, nil
 		}
 	case "linux":
-		if executable, err := lookup("secret-tool"); err == nil {
+		if executable, err := lookup("secret-tool"); err == nil && probeNativeBackend(commandBackendLinux, executable, runner) {
 			return newCommandStore(commandBackendLinux, executable, runner), BackendInfo{Name: BackendLinuxSecretService}, nil
 		}
 	}
@@ -51,4 +53,16 @@ func newStore(goos, directory string, lookup executableLookup, runner CommandRun
 		return nil, BackendInfo{}, err
 	}
 	return store, BackendInfo{Name: BackendFile, Warning: fallbackWarning}, nil
+}
+
+func probeNativeBackend(backend commandBackend, executable string, runner CommandRunner) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), nativeBackendProbeTimeout)
+	defer cancel()
+
+	arguments := []string{"search", "--all", "service", nativeServiceName}
+	if backend == commandBackendMacOS {
+		arguments = []string{"list-keychains"}
+	}
+	_, err := runner.Run(ctx, executable, arguments, "")
+	return err == nil
 }

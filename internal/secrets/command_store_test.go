@@ -48,6 +48,34 @@ func TestMacOSKeychainInvokesSecurityWithSafeArguments(t *testing.T) {
 	assertRecordedCommands(t, runner.commands(), want, secret)
 }
 
+func TestMacOSKeychainPasswordPromptFlagIsLastAndSecretUsesStdin(t *testing.T) {
+	t.Parallel()
+
+	const secret = "https://user:password@example.com/private?token=query-secret"
+	runner := &recordingRunner{}
+	store := newMacOSKeychainStore(runner)
+
+	if err := store.Set(context.Background(), "subscription-1", secret); err != nil {
+		t.Fatalf("Set() returned an unexpected error: %v", err)
+	}
+	commands := runner.commands()
+	if len(commands) != 1 {
+		t.Fatalf("recorded %d commands, want 1", len(commands))
+	}
+	command := commands[0]
+	if len(command.arguments) == 0 || command.arguments[len(command.arguments)-1] != "-w" {
+		t.Fatalf("arguments = %#v, want -w as the final option", command.arguments)
+	}
+	if command.stdin != secret {
+		t.Fatalf("stdin did not contain the secret")
+	}
+	for _, argument := range command.arguments {
+		if strings.Contains(argument, secret) {
+			t.Fatalf("secret appeared in argv: %#v", command.arguments)
+		}
+	}
+}
+
 func TestLinuxSecretServiceInvokesSecretToolWithSafeArguments(t *testing.T) {
 	t.Parallel()
 

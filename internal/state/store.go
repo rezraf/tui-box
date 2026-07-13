@@ -12,14 +12,19 @@ import (
 	"unicode/utf8"
 
 	"github.com/rezraf/tui-box/internal/domain"
+	"github.com/rezraf/tui-box/internal/filelock"
+	"github.com/rezraf/tui-box/internal/securepath"
 )
 
 const (
-	CurrentSchemaVersion = 1
-	StateFileName        = "state.json"
-	maxStateFileBytes    = 64 << 20
-	maxLastErrorBytes    = 4096
-	maxRefreshInterval   = 366 * 24 * 60 * 60
+	CurrentSchemaVersion  = 1
+	StateFileName         = "state.json"
+	StateLockFileName     = ".state.lock"
+	MaxStateSubscriptions = 1024
+	MaxStateEndpoints     = 10_000
+	maxStateFileBytes     = 64 << 20
+	maxLastErrorBytes     = 4096
+	maxRefreshInterval    = 366 * 24 * 60 * 60
 )
 
 var (
@@ -36,6 +41,7 @@ type Snapshot struct {
 type Store struct {
 	directory string
 	path      string
+	lockPath  string
 	mu        sync.Mutex
 }
 
@@ -47,21 +53,31 @@ func NewStore(directory string) (*Store, error) {
 	if err := validatePrivateStateFileIfPresent(path); err != nil {
 		return nil, errStateStore
 	}
-	return &Store{directory: directory, path: path}, nil
+	return &Store{directory: directory, path: path, lockPath: filepath.Join(directory, StateLockFileName)}, nil
 }
 
 func (store *Store) Load() (Snapshot, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	lock, err := store.acquireFileLock()
+	if err != nil {
+		return Snapshot{}, err
+	}
+	defer lock.Close()
 	return store.loadLocked()
 }
 
 func (store *Store) Save(snapshot Snapshot) error {
-	store.mu.Lock()
-	defer store.mu.Unlock()
 	if err := validateSnapshot(snapshot); err != nil {
 		return errInvalidState
 	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	lock, err := store.acquireFileLock()
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
 	return store.writeLocked(snapshot)
 }
 
@@ -78,6 +94,11 @@ func (store *Store) CommitSubscriptionRefresh(subscriptionID string, endpoints [
 
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	lock, err := store.acquireFileLock()
+	if err != nil {
+		return false, err
+	}
+	defer lock.Close()
 	snapshot, err := store.loadLocked()
 	if err != nil {
 		return false, err
@@ -101,6 +122,17 @@ func (store *Store) CommitSubscriptionRefresh(subscriptionID string, endpoints [
 		return false, err
 	}
 	return true, nil
+}
+
+func (store *Store) acquireFileLock() (*filelock.Lock, error) {
+	if err := ensurePrivateStateDirectory(store.directory); err != nil {
+		return nil, errStateStore
+	}
+	lock, err := filelock.Acquire(store.lockPath)
+	if err != nil {
+		return nil, errStateStore
+	}
+	return lock, nil
 }
 
 func (store *Store) loadLocked() (Snapshot, error) {
@@ -152,6 +184,9 @@ func (store *Store) writeLocked(snapshot Snapshot) error {
 		return errStateStore
 	}
 	encoded = append(encoded, '\n')
+	if len(encoded) > maxStateFileBytes {
+		return errInvalidState
+	}
 
 	temporary, err := os.CreateTemp(store.directory, "."+StateFileName+"-")
 	if err != nil {
@@ -185,7 +220,9 @@ func (store *Store) writeLocked(snapshot Snapshot) error {
 }
 
 func validateSnapshot(snapshot Snapshot) error {
-	if snapshot.SchemaVersion != CurrentSchemaVersion {
+	if snapshot.SchemaVersion != CurrentSchemaVersion ||
+		len(snapshot.Subscriptions) > MaxStateSubscriptions ||
+		len(snapshot.Endpoints) > MaxStateEndpoints {
 		return errInvalidState
 	}
 	subscriptionIDs := make(map[string]struct{}, len(snapshot.Subscriptions))
@@ -275,20 +312,7 @@ func validStateString(value string, maxBytes int, required bool) bool {
 }
 
 func ensurePrivateStateDirectory(directory string) error {
-	if directory == "" {
-		return errStateStore
-	}
-	info, err := os.Lstat(directory)
-	if errors.Is(err, os.ErrNotExist) {
-		if err := os.MkdirAll(directory, 0o700); err != nil {
-			return errStateStore
-		}
-		if err := os.Chmod(directory, 0o700); err != nil {
-			return errStateStore
-		}
-		info, err = os.Lstat(directory)
-	}
-	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm()&0o077 != 0 {
+	if err := securepath.EnsurePrivateDirectory(directory); err != nil {
 		return errStateStore
 	}
 	return nil

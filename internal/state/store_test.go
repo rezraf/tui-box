@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -35,6 +36,7 @@ func TestStoreUsesExplicitSchemaAndRestrictedPermissions(t *testing.T) {
 		t.Fatalf("Save() returned an unexpected error: %v", err)
 	}
 	assertMode(t, directory, 0o700)
+	assertMode(t, filepath.Join(directory, StateLockFileName), 0o600)
 	path := filepath.Join(directory, StateFileName)
 	assertMode(t, path, 0o600)
 
@@ -194,6 +196,21 @@ func TestStoreRefusesSymlinksAndUnsafeExistingPermissions(t *testing.T) {
 		}
 	})
 
+	t.Run("symlink nested ancestor", func(t *testing.T) {
+		root := t.TempDir()
+		target := filepath.Join(root, "target")
+		if err := os.Mkdir(target, 0o700); err != nil {
+			t.Fatalf("Mkdir(): %v", err)
+		}
+		ancestor := filepath.Join(root, "ancestor")
+		if err := os.Symlink(target, ancestor); err != nil {
+			t.Fatalf("Symlink(): %v", err)
+		}
+		if _, err := NewStore(filepath.Join(ancestor, "nested", "state")); err == nil {
+			t.Fatal("NewStore() accepted a symlinked ancestor")
+		}
+	})
+
 	t.Run("unsafe data directory mode", func(t *testing.T) {
 		directory := filepath.Join(t.TempDir(), "state")
 		if err := os.Mkdir(directory, 0o755); err != nil {
@@ -217,6 +234,24 @@ func TestStoreRefusesSymlinksAndUnsafeExistingPermissions(t *testing.T) {
 			t.Fatal("NewStore() accepted group/world-readable state file")
 		}
 	})
+}
+
+func TestStoreAllowsMacOSTemporaryDirectoryAlias(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("macOS system alias behavior")
+	}
+
+	temporaryRoot := t.TempDir()
+	resolvedRoot, err := filepath.EvalSymlinks(temporaryRoot)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(): %v", err)
+	}
+	if temporaryRoot == resolvedRoot {
+		t.Skip("temporary directory does not traverse the /var system alias")
+	}
+	if _, err := NewStore(filepath.Join(temporaryRoot, "nested", "state")); err != nil {
+		t.Fatalf("NewStore() rejected trusted macOS temporary-directory alias: %v", err)
+	}
 }
 
 func TestCommitSubscriptionRefreshPreservesLastKnownGoodCache(t *testing.T) {
@@ -310,6 +345,179 @@ func TestCommitSubscriptionRefreshReplacesOnlyTargetSubscriptionTransactionally(
 	}
 }
 
+func TestStoreRejectsEncodedStateAboveLoadLimitBeforeWrite(t *testing.T) {
+	directory := filepath.Join(t.TempDir(), "state")
+	store, err := NewStore(directory)
+	if err != nil {
+		t.Fatalf("NewStore() returned an unexpected error: %v", err)
+	}
+	original := testSnapshot()
+	if err := store.Save(original); err != nil {
+		t.Fatalf("initial Save() returned an unexpected error: %v", err)
+	}
+	path := filepath.Join(directory, StateFileName)
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat() before oversized Save: %v", err)
+	}
+
+	if err := store.Save(oversizedValidSnapshot()); err == nil {
+		after, statErr := os.Stat(path)
+		if statErr != nil {
+			t.Fatalf("Stat() after oversized Save: %v", statErr)
+		}
+		t.Fatalf("Save() accepted encoded state of %d bytes, limit is %d", after.Size(), maxStateFileBytes)
+	}
+
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat() after rejected Save: %v", err)
+	}
+	if !os.SameFile(before, after) {
+		t.Fatal("rejected oversized Save replaced the state file")
+	}
+	got, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load() after rejected Save returned an unexpected error: %v", err)
+	}
+	if !reflect.DeepEqual(got, original) {
+		t.Fatal("rejected oversized Save changed the stored snapshot")
+	}
+}
+
+func TestStoreEnforcesSubscriptionCountBoundary(t *testing.T) {
+	store, err := NewStore(filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatalf("NewStore() returned an unexpected error: %v", err)
+	}
+	atLimit := Snapshot{SchemaVersion: CurrentSchemaVersion, Subscriptions: testSubscriptions(MaxStateSubscriptions)}
+	if err := store.Save(atLimit); err != nil {
+		t.Fatalf("Save() rejected %d subscriptions: %v", MaxStateSubscriptions, err)
+	}
+	loaded, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load() rejected saved subscription boundary: %v", err)
+	}
+	if len(loaded.Subscriptions) != MaxStateSubscriptions {
+		t.Fatalf("Load() returned %d subscriptions, want %d", len(loaded.Subscriptions), MaxStateSubscriptions)
+	}
+
+	overLimit := Snapshot{SchemaVersion: CurrentSchemaVersion, Subscriptions: testSubscriptions(MaxStateSubscriptions + 1)}
+	if err := store.Save(overLimit); err == nil {
+		t.Fatalf("Save() accepted %d subscriptions", MaxStateSubscriptions+1)
+	}
+}
+
+func TestStoreEnforcesEndpointCountBoundary(t *testing.T) {
+	store, err := NewStore(filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatalf("NewStore() returned an unexpected error: %v", err)
+	}
+	subscription := domain.Subscription{ID: "subscription-a", Name: "Subscription A", SecretRef: "secret-a", Format: domain.SubscriptionFormatURIList}
+	atLimit := Snapshot{
+		SchemaVersion: CurrentSchemaVersion,
+		Subscriptions: []domain.Subscription{subscription},
+		Endpoints:     testEndpoints(MaxStateEndpoints, subscription.ID),
+	}
+	if err := store.Save(atLimit); err != nil {
+		t.Fatalf("Save() rejected %d endpoints: %v", MaxStateEndpoints, err)
+	}
+	loaded, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load() rejected saved endpoint boundary: %v", err)
+	}
+	if len(loaded.Endpoints) != MaxStateEndpoints {
+		t.Fatalf("Load() returned %d endpoints, want %d", len(loaded.Endpoints), MaxStateEndpoints)
+	}
+
+	overLimit := Snapshot{
+		SchemaVersion: CurrentSchemaVersion,
+		Subscriptions: []domain.Subscription{subscription},
+		Endpoints:     testEndpoints(MaxStateEndpoints+1, subscription.ID),
+	}
+	if err := store.Save(overLimit); err == nil {
+		t.Fatalf("Save() accepted %d endpoints", MaxStateEndpoints+1)
+	}
+}
+
+func TestIndependentStoresDoNotLoseConcurrentRefreshes(t *testing.T) {
+	directory := filepath.Join(t.TempDir(), "state")
+	first, err := NewStore(directory)
+	if err != nil {
+		t.Fatalf("first NewStore() returned an unexpected error: %v", err)
+	}
+	second, err := NewStore(directory)
+	if err != nil {
+		t.Fatalf("second NewStore() returned an unexpected error: %v", err)
+	}
+
+	original := Snapshot{
+		SchemaVersion: CurrentSchemaVersion,
+		Subscriptions: []domain.Subscription{
+			{ID: "subscription-a", Name: "A", SecretRef: "secret-a", Format: domain.SubscriptionFormatURIList},
+			{ID: "subscription-b", Name: "B", SecretRef: "secret-b", Format: domain.SubscriptionFormatURIList},
+			{ID: "subscription-c", Name: "C", SecretRef: "secret-c", Format: domain.SubscriptionFormatURIList},
+		},
+		Endpoints: []domain.Endpoint{
+			testEndpoint("old-a", "subscription-a", "old-a.example.com"),
+			testEndpoint("old-b", "subscription-b", "old-b.example.com"),
+		},
+	}
+	original.Endpoints = append(original.Endpoints, testEndpoints(500, "subscription-c")...)
+
+	for attempt := 0; attempt < 25; attempt++ {
+		if err := first.Save(original); err != nil {
+			t.Fatalf("attempt %d reset Save(): %v", attempt, err)
+		}
+		start := make(chan struct{})
+		errorsChannel := make(chan error, 2)
+		var waitGroup sync.WaitGroup
+		for _, operation := range []struct {
+			store          *Store
+			subscriptionID string
+			endpoint       domain.Endpoint
+		}{
+			{store: first, subscriptionID: "subscription-a", endpoint: testEndpoint("new-a", "subscription-a", "new-a.example.com")},
+			{store: second, subscriptionID: "subscription-b", endpoint: testEndpoint("new-b", "subscription-b", "new-b.example.com")},
+		} {
+			operation := operation
+			waitGroup.Add(1)
+			go func() {
+				defer waitGroup.Done()
+				<-start
+				committed, err := operation.store.CommitSubscriptionRefresh(operation.subscriptionID, []domain.Endpoint{operation.endpoint}, nil)
+				if err != nil {
+					errorsChannel <- err
+					return
+				}
+				if !committed {
+					errorsChannel <- errors.New("refresh was not committed")
+				}
+			}()
+		}
+		close(start)
+		waitGroup.Wait()
+		close(errorsChannel)
+		for err := range errorsChannel {
+			t.Fatalf("attempt %d concurrent refresh failed: %v", attempt, err)
+		}
+
+		got, err := first.Load()
+		if err != nil {
+			t.Fatalf("attempt %d Load(): %v", attempt, err)
+		}
+		endpointIDs := make(map[string]struct{}, len(got.Endpoints))
+		for _, endpoint := range got.Endpoints {
+			endpointIDs[endpoint.ID] = struct{}{}
+		}
+		for _, id := range []string{"new-a", "new-b"} {
+			if _, exists := endpointIDs[id]; !exists {
+				t.Fatalf("attempt %d lost concurrent update %q", attempt, id)
+			}
+		}
+	}
+}
+
 func TestStoreSupportsConcurrentAccess(t *testing.T) {
 	t.Parallel()
 
@@ -365,6 +573,65 @@ func TestStoreSupportsConcurrentAccess(t *testing.T) {
 	if len(got.Endpoints) != 2 {
 		t.Fatalf("len(final Endpoints) = %d, want one A and one preserved B", len(got.Endpoints))
 	}
+}
+
+func oversizedValidSnapshot() Snapshot {
+	const endpointCount = MaxStateEndpoints
+	longALPN := strings.Repeat("a", domain.MaxTLSFieldLength)
+	longHost := strings.Repeat("a", 63) + "." + strings.Repeat("b", 63) + "." + strings.Repeat("c", 63) + "." + strings.Repeat("d", 61)
+	endpoints := make([]domain.Endpoint, endpointCount)
+	for index := range endpoints {
+		suffix := fmt.Sprint(index)
+		endpoints[index] = domain.Endpoint{
+			ID:             "endpoint-" + suffix,
+			SubscriptionID: "subscription-a",
+			Name:           strings.Repeat("n", domain.MaxNameLength),
+			Protocol:       domain.ProtocolTrojan,
+			Host:           "host-" + suffix + ".example.com",
+			Port:           443,
+			Password:       strings.Repeat("p", domain.MaxCredentialLength),
+			TLS: domain.TLSOptions{
+				Enabled:    true,
+				ServerName: longHost,
+				ALPN:       []string{longALPN, longALPN, longALPN, longALPN, longALPN, longALPN, longALPN, longALPN, longALPN, longALPN, longALPN, longALPN, longALPN, longALPN, longALPN, longALPN},
+			},
+			Transport: domain.TransportOptions{
+				Type: domain.TransportWebSocket,
+				Path: strings.Repeat("/", domain.MaxTransportFieldLength),
+				Host: strings.Repeat("h", domain.MaxTransportFieldLength),
+			},
+		}
+	}
+	return Snapshot{
+		SchemaVersion: CurrentSchemaVersion,
+		Subscriptions: []domain.Subscription{{
+			ID: "subscription-a", Name: "Subscription A", SecretRef: "secret-a", Format: domain.SubscriptionFormatURIList,
+		}},
+		Endpoints: endpoints,
+	}
+}
+
+func testSubscriptions(count int) []domain.Subscription {
+	subscriptions := make([]domain.Subscription, count)
+	for index := range subscriptions {
+		suffix := fmt.Sprint(index)
+		subscriptions[index] = domain.Subscription{
+			ID:        "subscription-" + suffix,
+			Name:      "Subscription " + suffix,
+			SecretRef: "secret-" + suffix,
+			Format:    domain.SubscriptionFormatURIList,
+		}
+	}
+	return subscriptions
+}
+
+func testEndpoints(count int, subscriptionID string) []domain.Endpoint {
+	endpoints := make([]domain.Endpoint, count)
+	for index := range endpoints {
+		suffix := fmt.Sprint(index)
+		endpoints[index] = testEndpoint("endpoint-"+suffix, subscriptionID, "host-"+suffix+".example.com")
+	}
+	return endpoints
 }
 
 func testSnapshot() Snapshot {

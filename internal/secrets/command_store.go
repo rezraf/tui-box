@@ -92,6 +92,7 @@ func (store *commandStore) getArguments(key string) []string {
 
 func (store *commandStore) setArguments(key string) []string {
 	if store.backend == commandBackendMacOS {
+		// security(1) requires -w last to prompt on stdin without exposing the secret in argv.
 		return []string{"add-generic-password", "-U", "-a", key, "-s", nativeServiceName, "-w"}
 	}
 	return []string{"store", "--label", "TuiBox subscription", "service", nativeServiceName, "account", key}

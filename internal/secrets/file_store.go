@@ -8,10 +8,14 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+
+	"github.com/rezraf/tui-box/internal/filelock"
+	"github.com/rezraf/tui-box/internal/securepath"
 )
 
 const (
 	fallbackFileName     = "secrets.json"
+	fallbackLockFileName = ".secrets.lock"
 	maxFallbackFileBytes = 10 << 20
 )
 
@@ -20,6 +24,7 @@ var errFallbackStore = errors.New("local secret store operation failed")
 type fileStore struct {
 	directory string
 	path      string
+	lockPath  string
 	mu        sync.Mutex
 }
 
@@ -31,7 +36,7 @@ func newFileStore(directory string) (*fileStore, error) {
 	if err := validatePrivateFileIfPresent(path); err != nil {
 		return nil, errFallbackStore
 	}
-	return &fileStore{directory: directory, path: path}, nil
+	return &fileStore{directory: directory, path: path, lockPath: filepath.Join(directory, fallbackLockFileName)}, nil
 }
 
 func (store *fileStore) Get(ctx context.Context, key string) (string, error) {
@@ -43,6 +48,11 @@ func (store *fileStore) Get(ctx context.Context, key string) (string, error) {
 	if err := contextError(ctx); err != nil {
 		return "", err
 	}
+	lock, err := store.acquireFileLock()
+	if err != nil {
+		return "", err
+	}
+	defer lock.Close()
 	values, err := store.loadLocked()
 	if err != nil {
 		return "", err
@@ -63,6 +73,11 @@ func (store *fileStore) Set(ctx context.Context, key, secret string) error {
 	if err := contextError(ctx); err != nil {
 		return err
 	}
+	lock, err := store.acquireFileLock()
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
 	values, err := store.loadLocked()
 	if err != nil {
 		return err
@@ -80,6 +95,11 @@ func (store *fileStore) Delete(ctx context.Context, key string) error {
 	if err := contextError(ctx); err != nil {
 		return err
 	}
+	lock, err := store.acquireFileLock()
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
 	values, err := store.loadLocked()
 	if err != nil {
 		return err
@@ -89,6 +109,17 @@ func (store *fileStore) Delete(ctx context.Context, key string) error {
 	}
 	delete(values, key)
 	return store.writeLocked(values)
+}
+
+func (store *fileStore) acquireFileLock() (*filelock.Lock, error) {
+	if err := ensurePrivateDirectory(store.directory); err != nil {
+		return nil, errFallbackStore
+	}
+	lock, err := filelock.Acquire(store.lockPath)
+	if err != nil {
+		return nil, errFallbackStore
+	}
+	return lock, nil
 }
 
 func (store *fileStore) loadLocked() (map[string]string, error) {
@@ -172,20 +203,7 @@ func (store *fileStore) writeLocked(values map[string]string) error {
 }
 
 func ensurePrivateDirectory(directory string) error {
-	if directory == "" {
-		return errFallbackStore
-	}
-	info, err := os.Lstat(directory)
-	if errors.Is(err, os.ErrNotExist) {
-		if err := os.MkdirAll(directory, 0o700); err != nil {
-			return errFallbackStore
-		}
-		if err := os.Chmod(directory, 0o700); err != nil {
-			return errFallbackStore
-		}
-		info, err = os.Lstat(directory)
-	}
-	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm()&0o077 != 0 {
+	if err := securepath.EnsurePrivateDirectory(directory); err != nil {
 		return errFallbackStore
 	}
 	return nil
