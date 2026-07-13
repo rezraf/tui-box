@@ -254,7 +254,7 @@ func TestRunnerPrepareCreatesUniquePrivateAtomicConfigs(t *testing.T) {
 	}
 }
 
-func TestRunnerUsesOnlyFixedStdinCommands(t *testing.T) {
+func TestRunnerUsesExactNativeStdinToken(t *testing.T) {
 	t.Parallel()
 
 	runner, _ := newTestRunner(t, buildCoreHelper(t))
@@ -264,11 +264,11 @@ func TestRunnerUsesOnlyFixedStdinCommands(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := runner.Check(context.Background(), prepared); err != nil {
-		t.Fatalf("Check() did not use the fixed stdin command: %v", err)
+		t.Fatalf("Check() did not use the exact native stdin token: %v", err)
 	}
 	process, err := runner.Start(context.Background(), prepared)
 	if err != nil {
-		t.Fatalf("Start() did not use the fixed stdin command: %v", err)
+		t.Fatalf("Start() did not use the exact native stdin token: %v", err)
 	}
 	waitForOutput(t, process, "config-stdin")
 	if err := process.Signal(syscall.SIGTERM); err != nil {

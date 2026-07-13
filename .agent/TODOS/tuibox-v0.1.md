@@ -20,3 +20,5 @@
   - Verify: `go run ./cmd/tuibox --help && git grep -n 'TODO\|CHANGEME\|YOUR_' -- ':!go.sum'` returns no unintended placeholders
 - [ ] Complete adversarial security review and full verification
   - Verify: `go test -race ./... && go vet ./... && go build ./cmd/tuibox ./cmd/tuiboxd && ./scripts/cross-build.sh && git diff --check`
+- [ ] Remove local caches created by TuiBox development and verification
+  - Verify: TuiBox core-test cache and temporary build/release artifacts no longer exist; unrelated caches remain untouched

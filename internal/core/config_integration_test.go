@@ -2,6 +2,7 @@ package core
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
@@ -52,15 +53,32 @@ var pinnedCoreArtifacts = map[string]coreArtifact{
 	},
 }
 
-func TestGeneratedConfigsPassPinnedSingBoxCheckThroughRunnerStdin(t *testing.T) {
-	executable := os.Getenv("TUIBOX_SING_BOX")
-	if executable == "" {
-		if testing.Short() {
-			t.Skip("pinned sing-box download disabled by -short")
-		}
-		executable = downloadPinnedCore(t)
+func TestPinnedSingBoxNativeStdinTokenReadsPipedBytes(t *testing.T) {
+	executable := pinnedCoreExecutable(t)
+	directory := t.TempDir()
+	sameNamePath := filepath.Join(directory, "stdin")
+
+	if err := os.WriteFile(sameNamePath, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	assertPinnedCoreVersion(t, executable)
+	if output, err := runPinnedCoreStdinCheck(executable, directory, []byte("{}\n")); err != nil {
+		t.Fatalf("valid piped config failed with invalid same-name file: %v: %s", err, output)
+	}
+
+	if err := os.WriteFile(sameNamePath, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	output, err := runPinnedCoreStdinCheck(executable, directory, []byte("{"))
+	if err == nil {
+		t.Fatalf("invalid piped config passed with valid same-name file: %s", output)
+	}
+	if !strings.Contains(output, "decode config at stdin") {
+		t.Fatalf("invalid piped config error = %q, want decode config at stdin", output)
+	}
+}
+
+func TestGeneratedConfigsPassPinnedSingBoxCheckThroughRunnerNativeStdin(t *testing.T) {
+	executable := pinnedCoreExecutable(t)
 
 	runtimeDirectory := privateDirectory(t)
 	runner, err := NewRunner(executable, runtimeDirectory)
@@ -113,6 +131,31 @@ func TestGeneratedConfigsPassPinnedSingBoxCheckThroughRunnerStdin(t *testing.T) 
 	if checks < 60 {
 		t.Fatalf("core-check matrix ran %d checks, want at least 60", checks)
 	}
+}
+
+func pinnedCoreExecutable(t *testing.T) string {
+	t.Helper()
+	executable := os.Getenv("TUIBOX_SING_BOX")
+	if executable == "" {
+		if testing.Short() {
+			t.Skip("pinned sing-box download disabled by -short")
+		}
+		executable = downloadPinnedCore(t)
+	}
+	assertPinnedCoreVersion(t, executable)
+	return executable
+}
+
+func runPinnedCoreStdinCheck(executable, directory string, config []byte) (string, error) {
+	command := exec.Command(executable, "check", "-c", "stdin")
+	command.Dir = directory
+	command.Env = []string{}
+	command.Stdin = bytes.NewReader(config)
+	output := newBoundedBuffer(maxCoreOutputBytes)
+	command.Stdout = output
+	command.Stderr = output
+	err := command.Run()
+	return string(output.Bytes()), err
 }
 
 func downloadPinnedCore(t *testing.T) string {

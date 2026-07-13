@@ -13,7 +13,7 @@ import (
 const outputBytes = 128 * 1024
 
 func main() {
-	if len(os.Args) != 4 || os.Args[2] != "-c" || os.Args[3] != "/dev/stdin" {
+	if len(os.Args) != 4 || os.Args[2] != "-c" || os.Args[3] != "stdin" {
 		os.Exit(64)
 	}
 	if len(os.Environ()) != 0 {

@@ -22,7 +22,7 @@ const (
 	commandCheck = "check"
 	commandRun   = "run"
 
-	standardInputConfigPath = "/dev/stdin"
+	standardInputConfigToken = "stdin"
 
 	maxGeneratedConfigBytes = 128 * 1024
 	maxCoreOutputBytes      = 64 * 1024
@@ -419,7 +419,7 @@ func (runner *execRunner) inspectExecutable() error {
 }
 
 func (runner *execRunner) command(ctx context.Context, operation string, config []byte, request ConnectionRequest) *exec.Cmd {
-	command := exec.CommandContext(ctx, runner.executable, operation, "-c", standardInputConfigPath)
+	command := exec.CommandContext(ctx, runner.executable, operation, "-c", standardInputConfigToken)
 	command.Env = []string{}
 	command.Stdin = bytes.NewReader(config)
 	command.WaitDelay = processWaitDelay
