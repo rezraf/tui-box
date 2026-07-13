@@ -3,6 +3,7 @@ package rpc
 import (
 	"bytes"
 	"errors"
+	"math"
 	"net/netip"
 	"reflect"
 	"strings"
@@ -54,6 +55,19 @@ func TestDecodeRequestAcceptsOnlyOneStrictJSONValue(t *testing.T) {
 				t.Fatalf("decodeRequest() error = %v, want ErrInvalidRequest", err)
 			}
 		})
+	}
+}
+
+func TestDuplicateKeyScannerEnforcesMaximumNestingDepth(t *testing.T) {
+	t.Parallel()
+
+	atLimit := strings.Repeat("[", maxJSONNestingDepth) + "0" + strings.Repeat("]", maxJSONNestingDepth)
+	if err := rejectDuplicateKeys([]byte(atLimit)); err != nil {
+		t.Fatalf("rejectDuplicateKeys(depth=%d) failed: %v", maxJSONNestingDepth, err)
+	}
+	overLimit := "[" + atLimit + "]"
+	if err := rejectDuplicateKeys([]byte(overLimit)); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("rejectDuplicateKeys(depth=%d) error = %v, want ErrInvalidRequest", maxJSONNestingDepth+1, err)
 	}
 }
 
@@ -204,6 +218,20 @@ func TestConnectPayloadContainsOnlyTypedConnectionFields(t *testing.T) {
 	}
 }
 
+func TestConnectPayloadRejectsKernelIdentitySentinels(t *testing.T) {
+	t.Parallel()
+
+	payload := validRequest().Connect
+	for _, peer := range []PeerCredentials{
+		{UID: int(math.MaxUint32), GID: 20},
+		{UID: 501, GID: int(math.MaxUint32)},
+	} {
+		if _, err := payload.coreRequest(peer); !errors.Is(err, ErrInvalidRequest) {
+			t.Fatalf("coreRequest(%#v) error = %v, want ErrInvalidRequest", peer, err)
+		}
+	}
+}
+
 func TestConnectPayloadBoundsCollectionsAndCanonicalCIDRs(t *testing.T) {
 	t.Parallel()
 
@@ -242,6 +270,29 @@ func TestConnectPayloadBoundsCollectionsAndCanonicalCIDRs(t *testing.T) {
 				t.Fatalf("coreRequest() error = %v, want ErrInvalidRequest", err)
 			}
 		})
+	}
+}
+
+func TestProcessLifecycleErrorsUseStableRedactedCodes(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		err  error
+		code Code
+	}{
+		{err: ErrProcessStuck, code: CodeProcessStuck},
+		{err: ErrRollbackFailure, code: CodeRollbackFailure},
+	} {
+		response := responseForError("request-1", test.err)
+		if response.Error == nil || response.Error.Code != test.code || response.Error.Message != messageForCode(test.code) {
+			t.Fatalf("responseForError(%v) = %#v, want stable %q", test.err, response, test.code)
+		}
+		if err := validateResponse(response, "request-1"); err != nil {
+			t.Fatalf("validateResponse(%q) failed: %v", test.code, err)
+		}
+		if err := errorForCode(test.code); !errors.Is(err, test.err) {
+			t.Fatalf("errorForCode(%q) = %v, want %v", test.code, err, test.err)
+		}
 	}
 }
 

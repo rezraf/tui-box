@@ -111,7 +111,7 @@ func TestWaitForServerShutdownClosesAndWaitsForServe(t *testing.T) {
 	serveDone := make(chan error, 1)
 	closeCalled := make(chan struct{})
 	started := time.Now()
-	serveErr, closeErr := waitForServerShutdown(signalDone, serveDone, func() error {
+	serveErr, closeErr := waitForServerShutdown(signalDone, serveDone, func() {}, func() error {
 		close(closeCalled)
 		go func() {
 			time.Sleep(25 * time.Millisecond)
@@ -132,6 +132,51 @@ func TestWaitForServerShutdownClosesAndWaitsForServe(t *testing.T) {
 	}
 }
 
+func TestWaitForServerShutdownStopsSignalsBeforeClose(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		signalDone func() <-chan struct{}
+		serveDone  func() chan error
+	}{
+		{
+			name: "shutdown signal",
+			signalDone: func() <-chan struct{} {
+				done := make(chan struct{})
+				close(done)
+				return done
+			},
+			serveDone: func() chan error { return make(chan error, 1) },
+		},
+		{
+			name:       "server termination",
+			signalDone: func() <-chan struct{} { return make(chan struct{}) },
+			serveDone: func() chan error {
+				done := make(chan error, 1)
+				done <- nil
+				return done
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var events []string
+			serveDone := test.serveDone()
+			_, _ = waitForServerShutdown(test.signalDone(), serveDone, func() {
+				events = append(events, "stop-signals")
+			}, func() error {
+				events = append(events, "close-server")
+				select {
+				case serveDone <- nil:
+				default:
+				}
+				return nil
+			})
+			if want := []string{"stop-signals", "close-server"}; !reflect.DeepEqual(events, want) {
+				t.Fatalf("callback order = %v, want %v", events, want)
+			}
+		})
+	}
+}
+
 func TestPublicStartupErrorNeverIncludesUnderlyingDetails(t *testing.T) {
 	t.Parallel()
 
@@ -146,22 +191,28 @@ func TestPublicStartupErrorNeverIncludesUnderlyingDetails(t *testing.T) {
 	}
 }
 
-func TestUIDAndGIDBoundsMatchKernelIdentityWidth(t *testing.T) {
+func TestUIDAndGIDRejectKernelSentinel(t *testing.T) {
 	if uint64(math.MaxUint32) != 4294967295 {
 		t.Fatal("unexpected uint32 width")
 	}
-	options, err := parseOptions([]string{
+	valid := []string{
 		"--core", "/core",
 		"--runtime-dir", "/runtime",
 		"--socket", "/socket",
-		"--socket-gid", "4294967295",
-		"--allow-uid", "4294967295",
-	})
-	if err != nil {
-		t.Fatalf("parseOptions(max uint32) failed: %v", err)
+		"--socket-gid", "4294967294",
+		"--allow-uid", "4294967294",
 	}
-	if uint64(options.socketGID) != math.MaxUint32 || uint64(options.allowedUIDs[0]) != math.MaxUint32 {
-		t.Fatalf("max identities were not preserved: %#v", options)
+	options, err := parseOptions(valid)
+	if err != nil {
+		t.Fatalf("parseOptions(max real identity) failed: %v", err)
+	}
+	if uint64(options.socketGID) != math.MaxUint32-1 || uint64(options.allowedUIDs[0]) != math.MaxUint32-1 {
+		t.Fatalf("max real identities were not preserved: %#v", options)
+	}
+	for _, flagName := range []string{"--socket-gid", "--allow-uid"} {
+		if _, err := parseOptions(replaceFlag(valid, flagName, "4294967295")); !errors.Is(err, errInvalidOptions) {
+			t.Fatalf("parseOptions(%s sentinel) error = %v, want errInvalidOptions", flagName, err)
+		}
 	}
 }
 

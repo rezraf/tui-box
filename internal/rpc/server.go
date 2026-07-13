@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/rezraf/tui-box/internal/core"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -55,6 +56,8 @@ type ServerConfig struct {
 type Server struct {
 	listener         *net.UnixListener
 	socketPath       string
+	socketRoot       *os.Root
+	socketName       string
 	socketInfo       os.FileInfo
 	handler          Handler
 	allowedUIDs      map[int]struct{}
@@ -81,42 +84,45 @@ func NewServer(config ServerConfig) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	directoryInfo, err := inspectSocketDirectory(normalized.SocketPath, normalized.SocketGID)
+	canonicalPath, socketName, socketRoot, directoryInfo, err := openSocketRoot(normalized.SocketPath, normalized.SocketGID)
 	if err != nil {
 		return nil, err
 	}
-	if err := removeOwnedStaleSocket(normalized.SocketPath); err != nil {
+	cleanupRoot := true
+	defer func() {
+		if cleanupRoot {
+			_ = socketRoot.Close()
+		}
+	}()
+	if err := removeOwnedStaleSocket(socketRoot, socketName, canonicalPath); err != nil {
 		return nil, err
 	}
 
-	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: normalized.SocketPath, Net: "unix"})
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: canonicalPath, Net: "unix"})
 	if err != nil {
 		return nil, ErrUnsafeSocketPath
 	}
 	listener.SetUnlinkOnClose(false)
-	createdInfo, err := os.Lstat(normalized.SocketPath)
-	if err != nil || createdInfo.Mode()&os.ModeSocket == 0 || createdInfo.Mode()&os.ModeSymlink != 0 {
+	createdInfo, err := socketRoot.Lstat(socketName)
+	if err != nil || !validSocketInfo(createdInfo) {
 		_ = listener.Close()
 		return nil, ErrUnsafeSocketPath
 	}
-	cleanup := true
+	cleanupSocket := true
 	defer func() {
-		if cleanup {
+		if cleanupSocket {
 			_ = listener.Close()
-			_ = removeOwnedSocket(normalized.SocketPath, createdInfo)
+			_ = removeOwnedSocket(socketRoot, socketName, createdInfo)
 		}
 	}()
-	if err := os.Chown(normalized.SocketPath, os.Geteuid(), normalized.SocketGID); err != nil {
+	if err := configureSocket(socketRoot, socketName, createdInfo, normalized.SocketGID); err != nil {
+		return nil, err
+	}
+	info, err := socketRoot.Lstat(socketName)
+	if err != nil || !validSocketInfo(info) || info.Mode().Perm() != 0o660 || !os.SameFile(info, createdInfo) {
 		return nil, ErrUnsafeSocketPath
 	}
-	if err := os.Chmod(normalized.SocketPath, 0o660); err != nil {
-		return nil, ErrUnsafeSocketPath
-	}
-	info, err := os.Lstat(normalized.SocketPath)
-	if err != nil || info.Mode()&os.ModeSocket == 0 || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o660 || !os.SameFile(info, createdInfo) {
-		return nil, ErrUnsafeSocketPath
-	}
-	currentDirectoryInfo, err := os.Lstat(filepath.Dir(normalized.SocketPath))
+	currentDirectoryInfo, err := socketRoot.Stat(".")
 	if err != nil || !os.SameFile(currentDirectoryInfo, directoryInfo) {
 		return nil, ErrUnsafeSocketPath
 	}
@@ -128,7 +134,9 @@ func NewServer(config ServerConfig) (*Server, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	server := &Server{
 		listener:         listener,
-		socketPath:       normalized.SocketPath,
+		socketPath:       canonicalPath,
+		socketRoot:       socketRoot,
+		socketName:       socketName,
 		socketInfo:       info,
 		handler:          normalized.Handler,
 		allowedUIDs:      allowedUIDs,
@@ -142,12 +150,13 @@ func NewServer(config ServerConfig) (*Server, error) {
 		cancel:           cancel,
 		connections:      make(map[*net.UnixConn]struct{}),
 	}
-	cleanup = false
+	cleanupSocket = false
+	cleanupRoot = false
 	return server, nil
 }
 
 func validateServerConfig(config ServerConfig) (ServerConfig, map[int]struct{}, error) {
-	if config.Handler == nil || !validSocketPathString(config.SocketPath) || config.SocketGID < 0 || uint64(config.SocketGID) > math.MaxUint32 {
+	if config.Handler == nil || !validSocketPathString(config.SocketPath) || config.SocketGID < 0 || uint64(config.SocketGID) >= math.MaxUint32 {
 		return ServerConfig{}, nil, ErrUnsafeSocketPath
 	}
 	if len(config.AllowedUIDs) == 0 {
@@ -174,7 +183,7 @@ func validateServerConfig(config ServerConfig) (ServerConfig, map[int]struct{}, 
 	}
 	allowed := make(map[int]struct{}, len(config.AllowedUIDs))
 	for _, uid := range config.AllowedUIDs {
-		if uid < 0 || uint64(uid) > math.MaxUint32 {
+		if uid < 0 || uint64(uid) >= math.MaxUint32 {
 			return ServerConfig{}, nil, ErrInvalidRequest
 		}
 		allowed[uid] = struct{}{}
@@ -182,32 +191,106 @@ func validateServerConfig(config ServerConfig) (ServerConfig, map[int]struct{}, 
 	return config, allowed, nil
 }
 
-func inspectSocketDirectory(socketPath string, socketGID int) (os.FileInfo, error) {
-	directory := filepath.Dir(socketPath)
-	info, err := os.Lstat(directory)
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return nil, ErrUnsafeSocketPath
+func openSocketRoot(socketPath string, socketGID int) (string, string, *os.Root, os.FileInfo, error) {
+	canonicalDirectory, err := filepath.EvalSymlinks(filepath.Dir(socketPath))
+	if err != nil || !filepath.IsAbs(canonicalDirectory) {
+		return "", "", nil, nil, ErrUnsafeSocketPath
+	}
+	canonicalDirectory = filepath.Clean(canonicalDirectory)
+	canonicalPath := filepath.Join(canonicalDirectory, filepath.Base(socketPath))
+	if !validSocketPathString(canonicalPath) {
+		return "", "", nil, nil, ErrUnsafeSocketPath
+	}
+	if err := inspectSocketAncestors(canonicalDirectory); err != nil {
+		return "", "", nil, nil, err
+	}
+	before, err := os.Lstat(canonicalDirectory)
+	if err != nil || !validPrivateSocketDirectory(before, socketGID) {
+		return "", "", nil, nil, ErrUnsafeSocketPath
+	}
+	root, err := os.OpenRoot(canonicalDirectory)
+	if err != nil {
+		return "", "", nil, nil, ErrUnsafeSocketPath
+	}
+	after, err := root.Stat(".")
+	if err != nil || !validPrivateSocketDirectory(after, socketGID) || !os.SameFile(before, after) {
+		_ = root.Close()
+		return "", "", nil, nil, ErrUnsafeSocketPath
+	}
+	return canonicalPath, filepath.Base(socketPath), root, after, nil
+}
+
+func inspectSocketAncestors(directory string) error {
+	for {
+		info, err := os.Lstat(directory)
+		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o022 != 0 {
+			return ErrUnsafeSocketPath
+		}
+		uid, _, ok := fileIdentity(info)
+		if !ok || uid != 0 && uid != os.Geteuid() {
+			return ErrUnsafeSocketPath
+		}
+		parent := filepath.Dir(directory)
+		if parent == directory {
+			return nil
+		}
+		directory = parent
+	}
+}
+
+func validPrivateSocketDirectory(info os.FileInfo, socketGID int) bool {
+	if info == nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return false
 	}
 	uid, gid, ok := fileIdentity(info)
 	if !ok || uid != 0 && uid != os.Geteuid() {
-		return nil, ErrUnsafeSocketPath
+		return false
 	}
 	permissions := info.Mode().Perm()
 	if permissions&0o700 != 0o700 || permissions&0o027 != 0 {
-		return nil, ErrUnsafeSocketPath
+		return false
 	}
-	if permissions&0o050 != 0 && gid != socketGID {
-		return nil, ErrUnsafeSocketPath
-	}
-	return info, nil
+	return permissions&0o050 == 0 || gid == socketGID
 }
 
-func removeOwnedStaleSocket(path string) error {
-	info, err := os.Lstat(path)
+func validSocketInfo(info os.FileInfo) bool {
+	return info != nil && info.Mode()&os.ModeSocket != 0 && info.Mode()&os.ModeSymlink == 0
+}
+
+func configureSocket(root *os.Root, name string, expected os.FileInfo, socketGID int) error {
+	directory, err := root.Open(".")
+	if err != nil {
+		return ErrUnsafeSocketPath
+	}
+	defer directory.Close()
+	if err := unix.Fchownat(int(directory.Fd()), name, os.Geteuid(), socketGID, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return ErrUnsafeSocketPath
+	}
+	if err := unix.Fchmodat(int(directory.Fd()), name, 0o660, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		if !errors.Is(err, unix.EOPNOTSUPP) {
+			return ErrUnsafeSocketPath
+		}
+		current, statErr := root.Lstat(name)
+		if statErr != nil || !validSocketInfo(current) || !os.SameFile(current, expected) {
+			return ErrUnsafeSocketPath
+		}
+		if err := unix.Fchmodat(int(directory.Fd()), name, 0o660, 0); err != nil {
+			return ErrUnsafeSocketPath
+		}
+	}
+	current, err := root.Lstat(name)
+	if err != nil || !validSocketInfo(current) || !os.SameFile(current, expected) {
+		return ErrUnsafeSocketPath
+	}
+	return nil
+}
+
+func removeOwnedStaleSocket(root *os.Root, name, path string) error {
+	info, err := root.Lstat(name)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
-	if err != nil || info.Mode()&os.ModeSocket == 0 || info.Mode()&os.ModeSymlink != 0 {
+	if err != nil || !validSocketInfo(info) {
 		return ErrUnsafeSocketPath
 	}
 	uid, _, ok := fileIdentity(info)
@@ -222,7 +305,11 @@ func removeOwnedStaleSocket(path string) error {
 	if !errors.Is(probeErr, syscall.ECONNREFUSED) {
 		return ErrUnsafeSocketPath
 	}
-	if err := os.Remove(path); err != nil {
+	current, err := root.Lstat(name)
+	if err != nil || !validSocketInfo(current) || !os.SameFile(current, info) {
+		return ErrUnsafeSocketPath
+	}
+	if err := root.Remove(name); err != nil {
 		return ErrUnsafeSocketPath
 	}
 	return nil
@@ -333,9 +420,27 @@ func (server *Server) serveConnection(connection *net.UnixConn, peer PeerCredent
 		return
 	}
 	operationContext, cancel := context.WithTimeout(server.ctx, server.operationTimeout)
-	defer cancel()
+	disconnected := make(chan struct{})
+	if deadline, ok := operationContext.Deadline(); ok {
+		_ = connection.SetReadDeadline(deadline)
+	}
+	go watchClientDisconnect(connection, cancel, disconnected)
 	response := server.dispatch(operationContext, request, peer)
+	cancel()
+	_ = connection.SetReadDeadline(time.Now())
+	<-disconnected
 	server.writeResponse(connection, response)
+}
+
+func watchClientDisconnect(connection *net.UnixConn, cancel context.CancelFunc, done chan<- struct{}) {
+	defer close(done)
+	var buffer [1]byte
+	for {
+		if _, err := connection.Read(buffer[:]); err != nil {
+			cancel()
+			return
+		}
+	}
 }
 
 func (server *Server) dispatch(ctx context.Context, request Request, peer PeerCredentials) (response Response) {
@@ -404,7 +509,8 @@ func (server *Server) writeResponseFrame(connection *net.UnixConn, response Resp
 }
 
 func readFrame(reader io.Reader) ([]byte, error) {
-	buffered := bufio.NewReaderSize(reader, 32*1024)
+	limited := &io.LimitedReader{R: reader, N: MaxMessageBytes + 1}
+	buffered := bufio.NewReaderSize(limited, 32*1024)
 	var body bytes.Buffer
 	total := 0
 	oversized := false
@@ -465,7 +571,10 @@ func (server *Server) Close() error {
 			_ = connection.Close()
 		}
 		server.wait.Wait()
-		if err := removeOwnedSocket(server.socketPath, server.socketInfo); err != nil {
+		if err := removeOwnedSocket(server.socketRoot, server.socketName, server.socketInfo); err != nil {
+			closeErrors = append(closeErrors, err)
+		}
+		if err := server.socketRoot.Close(); err != nil {
 			closeErrors = append(closeErrors, err)
 		}
 		server.closeErr = errors.Join(closeErrors...)
@@ -473,19 +582,19 @@ func (server *Server) Close() error {
 	return server.closeErr
 }
 
-func removeOwnedSocket(path string, expected os.FileInfo) error {
-	current, err := os.Lstat(path)
+func removeOwnedSocket(root *os.Root, name string, expected os.FileInfo) error {
+	current, err := root.Lstat(name)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
-	if err != nil || current.Mode()&os.ModeSocket == 0 || current.Mode()&os.ModeSymlink != 0 {
+	if err != nil || !validSocketInfo(current) {
 		return nil
 	}
 	uid, _, ok := fileIdentity(current)
 	if !ok || uid != os.Geteuid() || expected != nil && !os.SameFile(current, expected) {
 		return nil
 	}
-	return os.Remove(path)
+	return root.Remove(name)
 }
 
 func fileIdentity(info os.FileInfo) (int, int, bool) {

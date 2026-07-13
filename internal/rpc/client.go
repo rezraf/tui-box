@@ -96,6 +96,7 @@ func (client *Client) call(ctx context.Context, operation Operation, payload *Co
 	}
 	stopCancellation := context.AfterFunc(ctx, func() {
 		_ = connection.SetDeadline(time.Now())
+		_ = connection.Close()
 	})
 	defer stopCancellation()
 

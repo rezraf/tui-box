@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -83,6 +84,35 @@ func TestServerAuthorizesOnlyExplicitUIDs(t *testing.T) {
 			t.Parallel()
 			if got := peerAuthorized(test.peer, test.allowed); got != test.want {
 				t.Fatalf("peerAuthorized(%#v) = %v, want %v", test.peer, got, test.want)
+			}
+		})
+	}
+}
+
+func TestServerConfigRejectsKernelIdentitySentinels(t *testing.T) {
+	t.Parallel()
+
+	base := ServerConfig{
+		SocketPath:  "/var/run/tuibox/tuiboxd.sock",
+		SocketGID:   20,
+		AllowedUIDs: []int{501},
+		Handler:     &testHandler{},
+	}
+	for _, test := range []struct {
+		name    string
+		mutate  func(*ServerConfig)
+		wantErr error
+	}{
+		{name: "socket GID", mutate: func(config *ServerConfig) { config.SocketGID = int(math.MaxUint32) }, wantErr: ErrUnsafeSocketPath},
+		{name: "allowed UID", mutate: func(config *ServerConfig) { config.AllowedUIDs = []int{int(math.MaxUint32)} }, wantErr: ErrInvalidRequest},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			config := base
+			test.mutate(&config)
+			if _, _, err := validateServerConfig(config); !errors.Is(err, test.wantErr) {
+				t.Fatalf("validateServerConfig(%s sentinel) error = %v, want %v", test.name, err, test.wantErr)
 			}
 		})
 	}
@@ -276,6 +306,33 @@ func TestServerEnforcesReadDeadlineAndMessageLimit(t *testing.T) {
 	})
 }
 
+func TestReadFrameReturnsImmediatelyWhenMessageLimitIsCrossed(t *testing.T) {
+	reader := newBlockingFrameReader(MaxMessageBytes + 1)
+	defer close(reader.release)
+	done := make(chan error, 1)
+	go func() {
+		_, err := readFrame(reader)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrInvalidRequest) {
+			t.Fatalf("readFrame() error = %v, want ErrInvalidRequest", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("readFrame() kept draining after crossing MaxMessageBytes")
+	}
+	if got := reader.bytesRead.Load(); got != MaxMessageBytes+1 {
+		t.Fatalf("source bytes read = %d, want exactly %d", got, MaxMessageBytes+1)
+	}
+	select {
+	case <-reader.blocked:
+		t.Fatal("readFrame() attempted another source read after crossing the limit")
+	default:
+	}
+}
+
 func TestServerProcessesOneRequestPerConnection(t *testing.T) {
 	server, socketPath := newTestServer(t, &testHandler{}, ServerConfig{})
 	defer server.Close()
@@ -417,15 +474,48 @@ func TestServerRejectsUnsafeSocketPathsAndPreservesFiles(t *testing.T) {
 		}
 	})
 
-	t.Run("symlink directory", func(t *testing.T) {
+	t.Run("writable canonical ancestor", func(t *testing.T) {
+		t.Parallel()
+		base := privateSocketDirectory(t)
+		writable := filepath.Join(base, "writable")
+		private := filepath.Join(writable, "private")
+		if err := os.MkdirAll(private, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(writable, 0o777); err != nil {
+			t.Fatal(err)
+		}
+		if server, err := NewServer(validConfig(filepath.Join(private, "socket"))); server != nil || !errors.Is(err, ErrUnsafeSocketPath) {
+			if server != nil {
+				_ = server.Close()
+			}
+			t.Fatalf("NewServer(writable ancestor) = %#v, %v, want ErrUnsafeSocketPath", server, err)
+		}
+	})
+
+	t.Run("canonical socket directory", func(t *testing.T) {
 		t.Parallel()
 		target := privateSocketDirectory(t)
-		link := filepath.Join(t.TempDir(), "socket-dir")
+		link := target + "-link"
 		if err := os.Symlink(target, link); err != nil {
 			t.Fatal(err)
 		}
-		if server, err := NewServer(validConfig(filepath.Join(link, "socket"))); server != nil || !errors.Is(err, ErrUnsafeSocketPath) {
-			t.Fatalf("NewServer(symlink parent) = %#v, %v, want ErrUnsafeSocketPath", server, err)
+		t.Cleanup(func() { _ = os.Remove(link) })
+		server, err := NewServer(validConfig(filepath.Join(link, "socket")))
+		if err != nil {
+			t.Fatalf("NewServer(canonical parent) failed: %v", err)
+		}
+		canonicalTarget, err := filepath.EvalSymlinks(target)
+		if err != nil {
+			_ = server.Close()
+			t.Fatal(err)
+		}
+		if got, want := server.SocketPath(), filepath.Join(canonicalTarget, "socket"); got != want {
+			_ = server.Close()
+			t.Fatalf("SocketPath() = %q, want canonical %q", got, want)
+		}
+		if err := server.Close(); err != nil {
+			t.Fatal(err)
 		}
 	})
 
@@ -515,6 +605,54 @@ func TestServerReplacesOnlyOwnedUnixSocketAndUnlinksOnlyItsOwn(t *testing.T) {
 	}
 }
 
+func TestServerCleanupUsesHeldRootAfterDirectoryReplacement(t *testing.T) {
+	directory := privateSocketDirectory(t)
+	path := filepath.Join(directory, "tuiboxd.sock")
+	server, err := NewServer(ServerConfig{
+		SocketPath:  path,
+		SocketGID:   os.Getegid(),
+		AllowedUIDs: []int{os.Geteuid()},
+		Handler:     &testHandler{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	moved := directory + ".moved"
+	if err := os.Rename(directory, moved); err != nil {
+		_ = server.Close()
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(directory, 0o700); err != nil {
+		_ = server.Close()
+		t.Fatal(err)
+	}
+	replacement := filepath.Join(directory, filepath.Base(path))
+	if err := os.WriteFile(replacement, []byte("replacement"), 0o600); err != nil {
+		_ = server.Close()
+		t.Fatal(err)
+	}
+	if err := server.Close(); err != nil {
+		t.Fatalf("Close() failed: %v", err)
+	}
+	content, err := os.ReadFile(replacement)
+	if err != nil || string(content) != "replacement" {
+		t.Fatalf("cleanup changed replacement path: %q, %v", content, err)
+	}
+	if _, err := os.Lstat(filepath.Join(moved, filepath.Base(path))); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("held-root socket remains after Close(): %v", err)
+	}
+	if err := os.Remove(replacement); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(directory); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(moved); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestServerOperationErrorsAreStableAndRedacted(t *testing.T) {
 	var handlerError atomic.Pointer[errorBox]
 	handlerError.Store(&errorBox{err: ErrCoreValidation})
@@ -546,6 +684,35 @@ func TestServerOperationErrorsAreStableAndRedacted(t *testing.T) {
 			t.Fatalf("Connect() leaked handler details: %v", err)
 		}
 	}
+}
+
+type blockingFrameReader struct {
+	remaining []byte
+	release   chan struct{}
+	blocked   chan struct{}
+	blockOnce sync.Once
+	bytesRead atomic.Int64
+}
+
+func newBlockingFrameReader(size int) *blockingFrameReader {
+	return &blockingFrameReader{
+		remaining: make([]byte, size),
+		release:   make(chan struct{}),
+		blocked:   make(chan struct{}),
+	}
+}
+
+func (reader *blockingFrameReader) Read(output []byte) (int, error) {
+	if len(reader.remaining) != 0 {
+		count := min(len(output), len(reader.remaining))
+		copy(output, reader.remaining[:count])
+		reader.remaining = reader.remaining[count:]
+		reader.bytesRead.Add(int64(count))
+		return count, nil
+	}
+	reader.blockOnce.Do(func() { close(reader.blocked) })
+	<-reader.release
+	return 0, io.EOF
 }
 
 type errorBox struct {
@@ -653,7 +820,11 @@ func startServer(t *testing.T, server *Server) {
 
 func privateSocketDirectory(t *testing.T) string {
 	t.Helper()
-	directory, err := os.MkdirTemp("/tmp", "tb-rpc-")
+	homeDirectory, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory, err := os.MkdirTemp(homeDirectory, ".tb-rpc-")
 	if err != nil {
 		t.Fatal(err)
 	}

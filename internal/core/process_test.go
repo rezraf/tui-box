@@ -391,14 +391,29 @@ func TestRunnerRejectsChangedExecutable(t *testing.T) {
 	}
 }
 
-func TestRunnerRejectsIdentityOverflow(t *testing.T) {
-	if strconvIntSize() < 64 {
-		t.Skip("int cannot represent a value larger than uint32")
+func TestRunnerRejectsIdentitySentinelAndOverflow(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*ConnectionRequest)
+		field  string
+	}{
+		{name: "UID sentinel", mutate: func(request *ConnectionRequest) { request.UID = int(math.MaxUint32) }, field: "UID"},
+		{name: "GID sentinel", mutate: func(request *ConnectionRequest) { request.GID = int(math.MaxUint32) }, field: "GID"},
+	} {
+		request := validConnectionRequest(domain.ConnectionModeTUN, domain.RouteModeGlobal)
+		test.mutate(&request)
+		if output, err := GenerateConfig(request); output != nil || err == nil || !strings.Contains(err.Error(), test.field) {
+			t.Fatalf("GenerateConfig(%s) = %q, %v, want %s rejection", test.name, output, err, test.field)
+		}
 	}
-	request := validConnectionRequest(domain.ConnectionModeProxy, domain.RouteModeGlobal)
+
+	if strconvIntSize() < 64 {
+		return
+	}
+	request := validConnectionRequest(domain.ConnectionModeTUN, domain.RouteModeGlobal)
 	request.GID = int(uint64(math.MaxUint32) + 1)
 	if output, err := GenerateConfig(request); output != nil || err == nil || !strings.Contains(err.Error(), "GID") {
-		t.Fatalf("GenerateConfig() = %q, %v, want GID rejection", output, err)
+		t.Fatalf("GenerateConfig(GID overflow) = %q, %v, want GID rejection", output, err)
 	}
 }
 

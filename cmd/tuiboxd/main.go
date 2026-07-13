@@ -61,7 +61,7 @@ func (values *uidValues) Set(input string) error {
 			return errInvalidOptions
 		}
 		parsed, err := strconv.ParseUint(part, 10, 32)
-		if err != nil {
+		if err != nil || parsed >= math.MaxUint32 {
 			return errInvalidOptions
 		}
 		values.values = append(values.values, int(parsed))
@@ -84,7 +84,7 @@ func parseOptions(arguments []string) (daemonOptions, error) {
 		return daemonOptions{}, errInvalidOptions
 	}
 	if !validAbsolutePath(options.corePath) || !validAbsolutePath(options.runtimeDirectory) || !validAbsolutePath(options.socketPath) ||
-		socketGID > math.MaxUint32 || len(allowed.values) == 0 {
+		socketGID >= math.MaxUint32 || len(allowed.values) == 0 {
 		return daemonOptions{}, errInvalidOptions
 	}
 	seen := make(map[int]struct{}, len(allowed.values))
@@ -155,16 +155,15 @@ func runDaemon(arguments []string, effectiveUID int) error {
 	}
 
 	signalContext, stopSignals := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stopSignals()
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- server.Serve() }()
 
-	serveErr, serverErr := waitForServerShutdown(signalContext.Done(), serveDone, server.Close)
+	serveErr, serverErr := waitForServerShutdown(signalContext.Done(), serveDone, stopSignals, server.Close)
 	serviceErr := service.Close()
 	return errors.Join(serveErr, serverErr, serviceErr)
 }
 
-func waitForServerShutdown(signalDone <-chan struct{}, serveDone <-chan error, closeServer func() error) (error, error) {
+func waitForServerShutdown(signalDone <-chan struct{}, serveDone <-chan error, stopSignals func(), closeServer func() error) (error, error) {
 	var serveErr error
 	serveReturned := false
 	select {
@@ -172,6 +171,7 @@ func waitForServerShutdown(signalDone <-chan struct{}, serveDone <-chan error, c
 	case serveErr = <-serveDone:
 		serveReturned = true
 	}
+	stopSignals()
 	closeErr := closeServer()
 	if !serveReturned {
 		serveErr = <-serveDone

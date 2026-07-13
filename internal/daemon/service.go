@@ -29,18 +29,26 @@ type Service struct {
 	active     *session
 	status     rpc.SessionStatus
 
-	closeOnce sync.Once
-	closeErr  error
+	monitorWait sync.WaitGroup
+
+	closeOnce       sync.Once
+	runnerCloseOnce sync.Once
+	closeErr        error
+	runnerCloseErr  error
 }
 
 type session struct {
-	generation uint64
-	mode       domain.ConnectionMode
-	route      domain.RouteMode
-	prepared   *core.PreparedConfig
-	process    core.Process
-	done       chan struct{}
-	stopping   bool
+	generation       uint64
+	mode             domain.ConnectionMode
+	route            domain.RouteMode
+	prepared         *core.PreparedConfig
+	process          core.Process
+	done             chan struct{}
+	cancel           context.CancelFunc
+	stopping         bool
+	rollbackPrevious *session
+	rollbackStatus   rpc.SessionStatus
+	failedOnExit     bool
 }
 
 func NewService(runner core.Runner, stopTimeout time.Duration) (*Service, error) {
@@ -86,6 +94,9 @@ func (service *Service) Connect(ctx context.Context, request core.ConnectionRequ
 		return service.status, rpc.ErrUnavailable
 	}
 
+	if service.active != nil && service.active.stopping {
+		return service.status, rpc.ErrProcessStuck
+	}
 	old := service.active
 	oldStatus := service.status
 	prepared, err := service.runner.Prepare(request)
@@ -112,19 +123,23 @@ func (service *Service) Connect(ctx context.Context, request core.ConnectionRequ
 			return service.status, err
 		}
 		old.stopping = true
+		old.rollbackPrevious = old
+		old.rollbackStatus = oldStatus
 		service.status.State = domain.ConnectionStatusDisconnecting
-		stopped, stopErr := service.stopSession(ctx, old)
-		if stopped {
-			service.active = nil
+		reaped, stopErr := service.stopSession(ctx, old)
+		if !reaped {
+			_ = prepared.Close()
+			return service.status, stopErr
+		}
+		service.active = nil
+		old.rollbackPrevious = nil
+		if old.cancel != nil {
+			old.cancel()
 		}
 		if stopErr != nil {
 			_ = prepared.Close()
-			if stopped {
-				_ = old.prepared.Close()
-				service.status = rpc.SessionStatus{State: domain.ConnectionStatusDisconnected}
-			} else {
-				old.stopping = false
-				service.status.State = domain.ConnectionStatusFailed
+			if rollbackErr := service.rollbackLocked(old, oldStatus); rollbackErr != nil {
+				return service.status, errors.Join(stopErr, rollbackErr)
 			}
 			return service.status, stopErr
 		}
@@ -134,26 +149,61 @@ func (service *Service) Connect(ctx context.Context, request core.ConnectionRequ
 		Mode:  request.Mode,
 		Route: request.Route,
 	}
+	if old != nil {
+		if contextErr := ctx.Err(); contextErr != nil {
+			_ = prepared.Close()
+			if rollbackErr := service.rollbackLocked(old, oldStatus); rollbackErr != nil {
+				return service.status, errors.Join(contextErr, rollbackErr)
+			}
+			return service.status, contextErr
+		}
+	}
 	process, err := service.runner.Start(service.lifetime, prepared)
 	if err != nil || process == nil {
 		_ = prepared.Close()
+		startErr := error(rpc.ErrProcessFailure)
+		if contextErr := ctx.Err(); contextErr != nil {
+			startErr = contextErr
+		}
 		if old != nil {
-			rollback, rollbackErr := service.runner.Start(service.lifetime, old.prepared)
-			if rollbackErr == nil && rollback != nil {
-				service.installSessionLocked(old.mode, old.route, old.prepared, rollback, oldStatus)
-				return service.status, rpc.ErrProcessFailure
+			if rollbackErr := service.rollbackLocked(old, oldStatus); rollbackErr == nil {
+				return service.status, startErr
+			} else {
+				return service.status, errors.Join(startErr, rollbackErr)
 			}
-			_ = old.prepared.Close()
 		}
 		service.status = rpc.SessionStatus{
 			State: domain.ConnectionStatusFailed,
 			Mode:  request.Mode,
 			Route: request.Route,
 		}
-		return service.status, rpc.ErrProcessFailure
+		return service.status, startErr
 	}
 
-	service.installSessionLocked(request.Mode, request.Route, prepared, process, rpc.SessionStatus{
+	if contextErr := ctx.Err(); contextErr != nil {
+		service.installSessionLocked(request.Mode, request.Route, prepared, process, nil, service.status)
+		current := service.active
+		current.stopping = true
+		current.rollbackPrevious = old
+		current.rollbackStatus = oldStatus
+		service.status.State = domain.ConnectionStatusDisconnecting
+		reaped, stopErr := service.stopSession(ctx, current)
+		if !reaped {
+			return service.status, stopErr
+		}
+		service.active = nil
+		current.rollbackPrevious = nil
+		_ = current.prepared.Close()
+		if old != nil {
+			if rollbackErr := service.rollbackLocked(old, oldStatus); rollbackErr != nil {
+				return service.status, errors.Join(contextErr, stopErr, rollbackErr)
+			}
+		} else {
+			service.status = rpc.SessionStatus{State: domain.ConnectionStatusDisconnected}
+		}
+		return service.status, errors.Join(contextErr, stopErr)
+	}
+	service.installSessionLocked(request.Mode, request.Route, prepared, process, nil, rpc.SessionStatus{
 		State: domain.ConnectionStatusConnected,
 		Mode:  request.Mode,
 		Route: request.Route,
@@ -175,7 +225,37 @@ func (service *Service) recordConnectFailureLocked(old *session, request core.Co
 	}
 }
 
-func (service *Service) installSessionLocked(mode domain.ConnectionMode, route domain.RouteMode, prepared *core.PreparedConfig, process core.Process, status rpc.SessionStatus) {
+func (service *Service) rollbackLocked(previous *session, previousStatus rpc.SessionStatus) error {
+	rollbackContext, rollbackCancel := context.WithCancel(service.lifetime)
+	timer := time.AfterFunc(service.stopTimeout, rollbackCancel)
+	process, err := service.runner.Start(rollbackContext, previous.prepared)
+	if !timer.Stop() || rollbackContext.Err() != nil || err != nil || process == nil {
+		if process != nil {
+			rollbackCancel()
+			service.installSessionLocked(previous.mode, previous.route, previous.prepared, process, rollbackCancel, rpc.SessionStatus{
+				State: domain.ConnectionStatusDisconnecting,
+				Mode:  previous.mode,
+				Route: previous.route,
+			})
+			service.active.stopping = true
+			service.active.failedOnExit = true
+			_ = process.Kill()
+			return errors.Join(rpc.ErrRollbackFailure, rpc.ErrProcessStuck)
+		}
+		rollbackCancel()
+		_ = previous.prepared.Close()
+		service.status = rpc.SessionStatus{
+			State: domain.ConnectionStatusFailed,
+			Mode:  previous.mode,
+			Route: previous.route,
+		}
+		return rpc.ErrRollbackFailure
+	}
+	service.installSessionLocked(previous.mode, previous.route, previous.prepared, process, rollbackCancel, previousStatus)
+	return nil
+}
+
+func (service *Service) installSessionLocked(mode domain.ConnectionMode, route domain.RouteMode, prepared *core.PreparedConfig, process core.Process, processCancel context.CancelFunc, status rpc.SessionStatus) {
 	service.generation++
 	current := &session{
 		generation: service.generation,
@@ -184,13 +264,16 @@ func (service *Service) installSessionLocked(mode domain.ConnectionMode, route d
 		prepared:   prepared,
 		process:    process,
 		done:       make(chan struct{}),
+		cancel:     processCancel,
 	}
 	service.active = current
 	service.status = status
+	service.monitorWait.Add(1)
 	go service.monitor(current)
 }
 
 func (service *Service) monitor(current *session) {
+	defer service.monitorWait.Done()
 	_ = current.process.Wait()
 	close(current.done)
 
@@ -199,14 +282,36 @@ func (service *Service) monitor(current *session) {
 		return
 	}
 	defer release()
-	if service.closed || service.active != current || service.generation != current.generation || current.stopping {
+	if service.active != current || service.generation != current.generation {
 		return
 	}
 	service.active = nil
-	service.status = rpc.SessionStatus{
-		State: domain.ConnectionStatusFailed,
-		Mode:  current.mode,
-		Route: current.route,
+	if current.cancel != nil {
+		current.cancel()
+	}
+	if current.stopping && current.rollbackPrevious != nil && !service.closed {
+		previous := current.rollbackPrevious
+		current.rollbackPrevious = nil
+		if current != previous {
+			_ = current.prepared.Close()
+		}
+		_ = service.rollbackLocked(previous, current.rollbackStatus)
+		return
+	}
+	if current.failedOnExit {
+		service.status = rpc.SessionStatus{
+			State: domain.ConnectionStatusFailed,
+			Mode:  current.mode,
+			Route: current.route,
+		}
+	} else if service.closed || current.stopping {
+		service.status = rpc.SessionStatus{State: domain.ConnectionStatusDisconnected}
+	} else {
+		service.status = rpc.SessionStatus{
+			State: domain.ConnectionStatusFailed,
+			Mode:  current.mode,
+			Route: current.route,
+		}
 	}
 	_ = current.prepared.Close()
 }
@@ -224,53 +329,70 @@ func (service *Service) Disconnect(ctx context.Context) (rpc.SessionStatus, erro
 		service.status = rpc.SessionStatus{State: domain.ConnectionStatusDisconnected}
 		return service.status, nil
 	}
-
+	if service.active.stopping {
+		return service.status, rpc.ErrProcessStuck
+	}
 	if err := ctx.Err(); err != nil {
 		return service.status, err
 	}
 	current := service.active
 	current.stopping = true
 	service.status.State = domain.ConnectionStatusDisconnecting
-	stopped, stopErr := service.stopSession(ctx, current)
-	if stopped {
-		service.active = nil
-		_ = current.prepared.Close()
-		service.status = rpc.SessionStatus{State: domain.ConnectionStatusDisconnected}
+	reaped, stopErr := service.stopSession(ctx, current)
+	if !reaped {
 		return service.status, stopErr
 	}
-	current.stopping = false
-	service.status.State = domain.ConnectionStatusFailed
+	service.active = nil
+	if current.cancel != nil {
+		current.cancel()
+	}
+	_ = current.prepared.Close()
+	service.status = rpc.SessionStatus{State: domain.ConnectionStatusDisconnected}
 	return service.status, stopErr
 }
 
 func (service *Service) stopSession(ctx context.Context, current *session) (bool, error) {
-	timer := time.NewTimer(service.stopTimeout)
-	defer timer.Stop()
+	return service.stopSessionUntil(ctx, current, time.Now().Add(service.stopTimeout))
+}
 
-	signalErr := current.process.Signal(syscall.SIGTERM)
-	if signalErr != nil && !errors.Is(signalErr, os.ErrProcessDone) {
-		// Continue to the single bounded wait and kill path.
+func (service *Service) stopSessionUntil(ctx context.Context, current *session, deadline time.Time) (bool, error) {
+	graceTimer := time.NewTimer(max(time.Until(deadline)/2, 0))
+	defer graceTimer.Stop()
+
+	var stopErr error
+	if err := current.process.Signal(syscall.SIGTERM); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		stopErr = rpc.ErrProcessFailure
 	}
 
 	select {
 	case <-current.done:
-		return true, ctx.Err()
+		return true, errors.Join(stopErr, ctx.Err())
 	case <-ctx.Done():
-		return killStoppedSession(current, ctx.Err())
-	case <-timer.C:
-		return killStoppedSession(current, ctx.Err())
+		stopErr = errors.Join(stopErr, ctx.Err())
+	case <-graceTimer.C:
 	}
-}
 
-func killStoppedSession(current *session, cause error) (bool, error) {
-	killErr := current.process.Kill()
-	if killErr != nil && !errors.Is(killErr, os.ErrProcessDone) {
-		if cause != nil {
-			return false, cause
-		}
-		return false, rpc.ErrProcessFailure
+	if err := current.process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		stopErr = errors.Join(stopErr, rpc.ErrProcessFailure)
 	}
-	return true, cause
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		select {
+		case <-current.done:
+			return true, errors.Join(stopErr, ctx.Err())
+		default:
+			return false, errors.Join(stopErr, ctx.Err(), rpc.ErrProcessStuck)
+		}
+	}
+
+	killTimer := time.NewTimer(remaining)
+	defer killTimer.Stop()
+	select {
+	case <-current.done:
+		return true, errors.Join(stopErr, ctx.Err())
+	case <-killTimer.C:
+		return false, errors.Join(stopErr, ctx.Err(), rpc.ErrProcessStuck)
+	}
 }
 
 func (service *Service) Status(ctx context.Context) (rpc.SessionStatus, error) {
@@ -307,32 +429,78 @@ func (service *Service) Close() error {
 			service.closeErr = err
 			return
 		}
-		defer release()
+
 		service.closed = true
+		stopDeadline := time.Now().Add(service.stopTimeout)
 		var closeErrors []error
 		if service.active != nil {
 			current := service.active
 			current.stopping = true
+			current.rollbackPrevious = nil
 			service.status.State = domain.ConnectionStatusDisconnecting
-			stopped, stopErr := service.stopSession(context.Background(), current)
+			reaped, stopErr := service.stopSessionUntil(context.Background(), current, stopDeadline)
 			if stopErr != nil {
 				closeErrors = append(closeErrors, stopErr)
-				service.status.State = domain.ConnectionStatusFailed
-			} else {
-				service.status = rpc.SessionStatus{State: domain.ConnectionStatusDisconnected}
 			}
-			if stopped {
+			if reaped {
 				service.active = nil
-			}
-			if err := current.prepared.Close(); err != nil {
-				closeErrors = append(closeErrors, err)
+				if current.cancel != nil {
+					current.cancel()
+				}
+				if err := current.prepared.Close(); err != nil {
+					closeErrors = append(closeErrors, err)
+				}
+				service.status = rpc.SessionStatus{State: domain.ConnectionStatusDisconnected}
 			}
 		}
 		service.cancel()
-		if err := service.runner.Close(); err != nil {
-			closeErrors = append(closeErrors, err)
+		release()
+
+		monitorsDone := make(chan struct{})
+		go func() {
+			service.monitorWait.Wait()
+			close(monitorsDone)
+		}()
+		monitorsFinished := false
+		if remaining := time.Until(stopDeadline); remaining > 0 {
+			timer := time.NewTimer(remaining)
+			select {
+			case <-monitorsDone:
+				monitorsFinished = true
+			case <-timer.C:
+			}
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		} else {
+			select {
+			case <-monitorsDone:
+				monitorsFinished = true
+			default:
+			}
+		}
+		if monitorsFinished {
+			if err := service.closeRunner(); err != nil {
+				closeErrors = append(closeErrors, err)
+			}
+		} else {
+			closeErrors = append(closeErrors, rpc.ErrProcessStuck)
+			go func() {
+				<-monitorsDone
+				_ = service.closeRunner()
+			}()
 		}
 		service.closeErr = errors.Join(closeErrors...)
 	})
 	return service.closeErr
+}
+
+func (service *Service) closeRunner() error {
+	service.runnerCloseOnce.Do(func() {
+		service.runnerCloseErr = service.runner.Close()
+	})
+	return service.runnerCloseErr
 }

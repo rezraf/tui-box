@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -66,6 +67,59 @@ func TestClientContextDeadlineInterruptsRequest(t *testing.T) {
 	case <-entered:
 	case <-time.After(time.Second):
 		t.Fatal("handler was never entered")
+	}
+}
+
+func TestClientCancellationCancelsServerHandlerBeforeFurtherWork(t *testing.T) {
+	entered := make(chan struct{})
+	canceled := make(chan struct{})
+	allowMutation := make(chan struct{})
+	var mutated atomic.Bool
+	handler := &testHandler{health: func(ctx context.Context) error {
+		close(entered)
+		select {
+		case <-ctx.Done():
+			close(canceled)
+			return ctx.Err()
+		case <-allowMutation:
+			mutated.Store(true)
+			return nil
+		}
+	}}
+	server, socketPath := newTestServer(t, handler, ServerConfig{OperationTimeout: time.Second})
+	defer server.Close()
+	client, err := NewClient(socketPath, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	clientDone := make(chan error, 1)
+	go func() { clientDone <- client.Health(ctx) }()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("handler was never entered")
+	}
+	cancel()
+	select {
+	case err := <-clientDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Health() error = %v, want context.Canceled", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("client did not return promptly after cancellation")
+	}
+	select {
+	case <-canceled:
+	case <-time.After(200 * time.Millisecond):
+		close(allowMutation)
+		t.Fatal("server handler did not observe peer cancellation")
+	}
+	close(allowMutation)
+	time.Sleep(20 * time.Millisecond)
+	if mutated.Load() {
+		t.Fatal("handler mutated state after canceled client returned")
 	}
 }
 

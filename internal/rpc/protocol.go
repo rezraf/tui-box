@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
 	"net/netip"
 	"strings"
 	"unicode/utf8"
@@ -15,11 +16,12 @@ import (
 )
 
 const (
-	ProtocolVersion    = 1
-	MaxMessageBytes    = 256 * 1024
-	MaxRequestIDBytes  = 64
-	MaxDirectRules     = 64
-	maxResponseMessage = 128
+	ProtocolVersion     = 1
+	MaxMessageBytes     = 256 * 1024
+	MaxRequestIDBytes   = 64
+	MaxDirectRules      = 64
+	maxJSONNestingDepth = 32
+	maxResponseMessage  = 128
 )
 
 type Operation string
@@ -39,6 +41,8 @@ const (
 	CodeAccessDenied       Code = "access_denied"
 	CodeCoreValidation     Code = "core_validation_failed"
 	CodeProcessFailure     Code = "process_failed"
+	CodeProcessStuck       Code = "process_stuck"
+	CodeRollbackFailure    Code = "rollback_failed"
 	CodeUnavailable        Code = "unavailable"
 	CodeTimeout            Code = "timeout"
 	CodeInternal           Code = "internal"
@@ -50,6 +54,8 @@ var (
 	ErrAccessDenied       = errors.New("access is denied")
 	ErrCoreValidation     = errors.New("core configuration was rejected")
 	ErrProcessFailure     = errors.New("core process operation failed")
+	ErrProcessStuck       = errors.New("core process did not exit")
+	ErrRollbackFailure    = errors.New("previous core session could not be restored")
 	ErrUnavailable        = errors.New("daemon is unavailable")
 	ErrTimeout            = errors.New("operation timed out")
 	ErrInternal           = errors.New("internal daemon error")
@@ -154,7 +160,7 @@ func decodeStrict(data []byte, destination any) error {
 
 func rejectDuplicateKeys(data []byte) error {
 	decoder := json.NewDecoder(bytes.NewReader(data))
-	if err := consumeJSONValue(decoder); err != nil {
+	if err := consumeJSONValue(decoder, 0); err != nil {
 		return err
 	}
 	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
@@ -163,7 +169,7 @@ func rejectDuplicateKeys(data []byte) error {
 	return nil
 }
 
-func consumeJSONValue(decoder *json.Decoder) error {
+func consumeJSONValue(decoder *json.Decoder, depth int) error {
 	token, err := decoder.Token()
 	if err != nil {
 		return err
@@ -171,6 +177,10 @@ func consumeJSONValue(decoder *json.Decoder) error {
 	delimiter, isDelimiter := token.(json.Delim)
 	if !isDelimiter {
 		return nil
+	}
+	depth++
+	if depth > maxJSONNestingDepth {
+		return ErrInvalidRequest
 	}
 
 	switch delimiter {
@@ -193,7 +203,7 @@ func consumeJSONValue(decoder *json.Decoder) error {
 			if key != canonicalKey {
 				return ErrInvalidRequest
 			}
-			if err := consumeJSONValue(decoder); err != nil {
+			if err := consumeJSONValue(decoder, depth); err != nil {
 				return err
 			}
 		}
@@ -203,7 +213,7 @@ func consumeJSONValue(decoder *json.Decoder) error {
 		}
 	case '[':
 		for decoder.More() {
-			if err := consumeJSONValue(decoder); err != nil {
+			if err := consumeJSONValue(decoder, depth); err != nil {
 				return err
 			}
 		}
@@ -255,7 +265,8 @@ func validRequestID(value string) bool {
 }
 
 func (payload *ConnectPayload) coreRequest(peer PeerCredentials) (core.ConnectionRequest, error) {
-	if payload == nil || peer.UID < 0 || peer.GID < 0 || len(payload.DirectDomainSuffixes) > MaxDirectRules || len(payload.DirectCIDRs) > MaxDirectRules {
+	if payload == nil || peer.UID < 0 || uint64(peer.UID) >= math.MaxUint32 || peer.GID < 0 || uint64(peer.GID) >= math.MaxUint32 ||
+		len(payload.DirectDomainSuffixes) > MaxDirectRules || len(payload.DirectCIDRs) > MaxDirectRules {
 		return core.ConnectionRequest{}, ErrInvalidRequest
 	}
 	for _, prefix := range payload.DirectCIDRs {
@@ -301,6 +312,10 @@ func codeForError(err error) Code {
 		return CodeAccessDenied
 	case errors.Is(err, ErrCoreValidation):
 		return CodeCoreValidation
+	case errors.Is(err, ErrProcessStuck):
+		return CodeProcessStuck
+	case errors.Is(err, ErrRollbackFailure):
+		return CodeRollbackFailure
 	case errors.Is(err, ErrProcessFailure):
 		return CodeProcessFailure
 	case errors.Is(err, ErrUnavailable):
@@ -324,6 +339,10 @@ func messageForCode(code Code) string {
 		return ErrCoreValidation.Error()
 	case CodeProcessFailure:
 		return ErrProcessFailure.Error()
+	case CodeProcessStuck:
+		return ErrProcessStuck.Error()
+	case CodeRollbackFailure:
+		return ErrRollbackFailure.Error()
 	case CodeUnavailable:
 		return ErrUnavailable.Error()
 	case CodeTimeout:
@@ -347,6 +366,10 @@ func errorForCode(code Code) error {
 		return ErrCoreValidation
 	case CodeProcessFailure:
 		return ErrProcessFailure
+	case CodeProcessStuck:
+		return ErrProcessStuck
+	case CodeRollbackFailure:
+		return ErrRollbackFailure
 	case CodeUnavailable:
 		return ErrUnavailable
 	case CodeTimeout:

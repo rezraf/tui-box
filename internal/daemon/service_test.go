@@ -168,6 +168,28 @@ func TestConnectChecksReplacementBeforeStoppingActiveProcess(t *testing.T) {
 	}
 }
 
+func TestCanceledInitialStartStopsProcessBeforeReturning(t *testing.T) {
+	process := newFakeProcess(true)
+	ctx, cancel := context.WithCancel(context.Background())
+	runner := newFakeRunner()
+	runner.start = func(int, context.Context, *core.PreparedConfig) (core.Process, error) {
+		cancel()
+		return process, nil
+	}
+	service := newTestService(t, runner, 80*time.Millisecond)
+
+	status, err := service.Connect(ctx, connectionRequest(domain.ConnectionModeTUN, domain.RouteModeGlobal))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Connect() error = %v, want context.Canceled", err)
+	}
+	if status.State != domain.ConnectionStatusDisconnected || service.active != nil {
+		t.Fatalf("canceled Connect() status = %#v, want no active session", status)
+	}
+	if process.signalCount() != 1 {
+		t.Fatalf("canceled process signals = %d, want process retired before return", process.signalCount())
+	}
+}
+
 func TestCanceledReplacementAfterCheckPreservesOldSession(t *testing.T) {
 	oldProcess := newFakeProcess(true)
 	runner := newFakeRunner()
@@ -193,6 +215,226 @@ func TestCanceledReplacementAfterCheckPreservesOldSession(t *testing.T) {
 	status := mustServiceStatus(t, service)
 	if status.State != domain.ConnectionStatusConnected || status.Route != domain.RouteModeGlobal {
 		t.Fatalf("status after cancellation = %#v, want old connected session", status)
+	}
+}
+
+func TestCanceledReplacementAfterStoppingOldRestartsCheckedOldConfig(t *testing.T) {
+	oldProcess := newFakeProcess(true)
+	rollbackProcess := newFakeProcess(true)
+	ctx, cancel := context.WithCancel(context.Background())
+	oldProcess.signalHook = func(signal os.Signal) {
+		if signal == syscall.SIGTERM {
+			cancel()
+		}
+	}
+	runner := newFakeRunner()
+	runner.start = func(call int, _ context.Context, _ *core.PreparedConfig) (core.Process, error) {
+		switch call {
+		case 1:
+			return oldProcess, nil
+		case 2:
+			return rollbackProcess, nil
+		default:
+			return nil, errors.New("unexpected start")
+		}
+	}
+	service := newTestService(t, runner, 100*time.Millisecond)
+	oldRequest := connectionRequest(domain.ConnectionModeTUN, domain.RouteModeGlobal)
+	if _, err := service.Connect(context.Background(), oldRequest); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := service.Connect(ctx, connectionRequest(domain.ConnectionModeTUN, domain.RouteModeRule)); !errors.Is(err, context.Canceled) {
+		t.Fatalf("replacement error = %v, want context.Canceled", err)
+	}
+	starts := runner.startedPrepared()
+	if len(starts) != 2 || starts[0] != starts[1] {
+		t.Fatalf("Start prepared sequence = %v, want old then checked-old rollback", starts)
+	}
+	status := mustServiceStatus(t, service)
+	if status.State != domain.ConnectionStatusConnected || status.Mode != oldRequest.Mode || status.Route != oldRequest.Route {
+		t.Fatalf("status after canceled replacement = %#v, want restored old session", status)
+	}
+	if service.active == nil || service.active.process != rollbackProcess {
+		t.Fatal("canceled replacement did not track rollback process")
+	}
+}
+
+func TestCanceledReplacementDuringKillWaitRestartsCheckedOldConfig(t *testing.T) {
+	oldProcess := newStubbornFakeProcess()
+	oldProcess.killObserved = make(chan struct{})
+	rollbackProcess := newFakeProcess(true)
+	runner := newFakeRunner()
+	runner.start = func(call int, _ context.Context, _ *core.PreparedConfig) (core.Process, error) {
+		switch call {
+		case 1:
+			return oldProcess, nil
+		case 2:
+			return rollbackProcess, nil
+		default:
+			return nil, errors.New("unexpected start")
+		}
+	}
+	service := newTestService(t, runner, 160*time.Millisecond)
+	oldRequest := connectionRequest(domain.ConnectionModeTUN, domain.RouteModeGlobal)
+	if _, err := service.Connect(context.Background(), oldRequest); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := service.Connect(ctx, connectionRequest(domain.ConnectionModeTUN, domain.RouteModeRule))
+		done <- err
+	}()
+	select {
+	case <-oldProcess.killObserved:
+	case <-time.After(time.Second):
+		oldProcess.exit(nil)
+		t.Fatal("replacement did not enter post-kill wait")
+	}
+	cancel()
+	oldProcess.exit(nil)
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("replacement error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("replacement did not return after old Wait completed")
+	}
+	starts := runner.startedPrepared()
+	if len(starts) != 2 || starts[0] != starts[1] {
+		t.Fatalf("Start prepared sequence = %v, want old then checked-old rollback", starts)
+	}
+	status := mustServiceStatus(t, service)
+	if status.State != domain.ConnectionStatusConnected || status.Mode != oldRequest.Mode || status.Route != oldRequest.Route {
+		t.Fatalf("status after cancellation during kill wait = %#v, want restored old session", status)
+	}
+}
+
+func TestCanceledReplacementStartStopsNewAndRestoresOldConfig(t *testing.T) {
+	oldProcess := newFakeProcess(true)
+	newProcess := newFakeProcess(true)
+	rollbackProcess := newFakeProcess(true)
+	ctx, cancel := context.WithCancel(context.Background())
+	runner := newFakeRunner()
+	runner.start = func(call int, _ context.Context, _ *core.PreparedConfig) (core.Process, error) {
+		switch call {
+		case 1:
+			return oldProcess, nil
+		case 2:
+			cancel()
+			return newProcess, nil
+		case 3:
+			return rollbackProcess, nil
+		default:
+			return nil, errors.New("unexpected start")
+		}
+	}
+	service := newTestService(t, runner, 120*time.Millisecond)
+	oldRequest := connectionRequest(domain.ConnectionModeTUN, domain.RouteModeGlobal)
+	if _, err := service.Connect(context.Background(), oldRequest); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := service.Connect(ctx, connectionRequest(domain.ConnectionModeTUN, domain.RouteModeRule)); !errors.Is(err, context.Canceled) {
+		t.Fatalf("replacement error = %v, want context.Canceled", err)
+	}
+	starts := runner.startedPrepared()
+	if len(starts) != 3 || starts[0] == starts[1] || starts[0] != starts[2] {
+		t.Fatalf("Start prepared sequence = %v, want old, new, checked-old rollback", starts)
+	}
+	if newProcess.signalCount() != 1 {
+		t.Fatalf("new process signals = %d, want canceled replacement stopped", newProcess.signalCount())
+	}
+	status := mustServiceStatus(t, service)
+	if status.State != domain.ConnectionStatusConnected || status.Mode != oldRequest.Mode || status.Route != oldRequest.Route {
+		t.Fatalf("status after canceled Start = %#v, want restored old session", status)
+	}
+}
+
+func TestCanceledReplacementStartFailureRestoresOldConfig(t *testing.T) {
+	oldProcess := newFakeProcess(true)
+	rollbackProcess := newFakeProcess(true)
+	ctx, cancel := context.WithCancel(context.Background())
+	runner := newFakeRunner()
+	runner.start = func(call int, _ context.Context, _ *core.PreparedConfig) (core.Process, error) {
+		switch call {
+		case 1:
+			return oldProcess, nil
+		case 2:
+			cancel()
+			return nil, core.ErrCoreStartFailed
+		case 3:
+			return rollbackProcess, nil
+		default:
+			return nil, errors.New("unexpected start")
+		}
+	}
+	service := newTestService(t, runner, 80*time.Millisecond)
+	oldRequest := connectionRequest(domain.ConnectionModeTUN, domain.RouteModeGlobal)
+	if _, err := service.Connect(context.Background(), oldRequest); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := service.Connect(ctx, connectionRequest(domain.ConnectionModeTUN, domain.RouteModeRule)); !errors.Is(err, context.Canceled) {
+		t.Fatalf("replacement error = %v, want context.Canceled", err)
+	}
+	starts := runner.startedPrepared()
+	if len(starts) != 3 || starts[0] == starts[1] || starts[0] != starts[2] {
+		t.Fatalf("Start prepared sequence = %v, want old, failed new, old rollback", starts)
+	}
+	status := mustServiceStatus(t, service)
+	if status.State != domain.ConnectionStatusConnected || status.Mode != oldRequest.Mode || status.Route != oldRequest.Route {
+		t.Fatalf("status after canceled Start failure = %#v, want restored old session", status)
+	}
+}
+
+func TestCanceledStuckReplacementRestoresOldAfterLateExit(t *testing.T) {
+	oldProcess := newFakeProcess(true)
+	newProcess := newStubbornFakeProcess()
+	rollbackProcess := newFakeProcess(true)
+	ctx, cancel := context.WithCancel(context.Background())
+	runner := newFakeRunner()
+	runner.start = func(call int, _ context.Context, _ *core.PreparedConfig) (core.Process, error) {
+		switch call {
+		case 1:
+			return oldProcess, nil
+		case 2:
+			cancel()
+			return newProcess, nil
+		case 3:
+			return rollbackProcess, nil
+		default:
+			return nil, errors.New("unexpected start")
+		}
+	}
+	service := newTestService(t, runner, 60*time.Millisecond)
+	oldRequest := connectionRequest(domain.ConnectionModeTUN, domain.RouteModeGlobal)
+	if _, err := service.Connect(context.Background(), oldRequest); err != nil {
+		t.Fatal(err)
+	}
+
+	status, err := service.Connect(ctx, connectionRequest(domain.ConnectionModeTUN, domain.RouteModeRule))
+	if !errors.Is(err, rpc.ErrProcessStuck) || !errors.Is(err, context.Canceled) {
+		newProcess.exit(nil)
+		t.Fatalf("replacement error = %v, want canceled ErrProcessStuck", err)
+	}
+	if status.State != domain.ConnectionStatusDisconnecting || service.active == nil || service.active.process != newProcess {
+		newProcess.exit(nil)
+		t.Fatalf("stuck new process status = %#v, want tracked disconnecting session", status)
+	}
+	if runner.startCount() != 2 {
+		newProcess.exit(nil)
+		t.Fatalf("Start calls before new Wait completes = %d, want 2", runner.startCount())
+	}
+
+	newProcess.exit(nil)
+	waitForStatus(t, service, domain.ConnectionStatusConnected)
+	starts := runner.startedPrepared()
+	if len(starts) != 3 || starts[0] == starts[1] || starts[0] != starts[2] {
+		t.Fatalf("Start prepared sequence = %v, want old, canceled new, old rollback", starts)
 	}
 }
 
@@ -224,6 +466,48 @@ func TestFailedReplacementCheckPreservesOldSession(t *testing.T) {
 	status := mustServiceStatus(t, service)
 	if status.State != domain.ConnectionStatusConnected || status.Mode != oldRequest.Mode || status.Route != oldRequest.Route {
 		t.Fatalf("status after failed check = %#v, want old connected session", status)
+	}
+}
+
+func TestStuckReplacementRestartsOldConfigAfterLateExit(t *testing.T) {
+	oldProcess := newStubbornFakeProcess()
+	rollbackProcess := newFakeProcess(true)
+	runner := newFakeRunner()
+	runner.start = func(call int, _ context.Context, _ *core.PreparedConfig) (core.Process, error) {
+		switch call {
+		case 1:
+			return oldProcess, nil
+		case 2:
+			return rollbackProcess, nil
+		default:
+			return nil, errors.New("unexpected start")
+		}
+	}
+	service := newTestService(t, runner, 60*time.Millisecond)
+	oldRequest := connectionRequest(domain.ConnectionModeTUN, domain.RouteModeGlobal)
+	if _, err := service.Connect(context.Background(), oldRequest); err != nil {
+		t.Fatal(err)
+	}
+
+	status, err := service.Connect(context.Background(), connectionRequest(domain.ConnectionModeTUN, domain.RouteModeRule))
+	if !errors.Is(err, rpc.ErrProcessStuck) {
+		oldProcess.exit(nil)
+		t.Fatalf("replacement error = %v, want ErrProcessStuck", err)
+	}
+	if status.State != domain.ConnectionStatusDisconnecting || runner.startCount() != 1 {
+		oldProcess.exit(nil)
+		t.Fatalf("stuck replacement = %#v with %d starts, want tracked old only", status, runner.startCount())
+	}
+
+	oldProcess.exit(nil)
+	waitForStatus(t, service, domain.ConnectionStatusConnected)
+	starts := runner.startedPrepared()
+	if len(starts) != 2 || starts[0] != starts[1] {
+		t.Fatalf("Start prepared sequence = %v, want old then late rollback", starts)
+	}
+	status = mustServiceStatus(t, service)
+	if status.Mode != oldRequest.Mode || status.Route != oldRequest.Route || service.active == nil || service.active.process != rollbackProcess {
+		t.Fatalf("late rollback status = %#v, want restored old session", status)
 	}
 }
 
@@ -265,7 +549,7 @@ func TestFailedReplacementStartRollsBackCheckedOldConfig(t *testing.T) {
 	}
 }
 
-func TestFailedReplacementAndRollbackLeavesFailedStatus(t *testing.T) {
+func TestFailedReplacementAndRollbackReportsStableFailure(t *testing.T) {
 	oldProcess := newFakeProcess(true)
 	runner := newFakeRunner()
 	runner.start = func(call int, _ context.Context, _ *core.PreparedConfig) (core.Process, error) {
@@ -275,15 +559,93 @@ func TestFailedReplacementAndRollbackLeavesFailedStatus(t *testing.T) {
 		return nil, core.ErrCoreStartFailed
 	}
 	service := newTestService(t, runner, 50*time.Millisecond)
+	oldRequest := connectionRequest(domain.ConnectionModeTUN, domain.RouteModeGlobal)
+	if _, err := service.Connect(context.Background(), oldRequest); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Connect(context.Background(), connectionRequest(domain.ConnectionModeTUN, domain.RouteModeRule)); !errors.Is(err, rpc.ErrRollbackFailure) {
+		t.Fatalf("replacement error = %v, want ErrRollbackFailure", err)
+	}
+	status := mustServiceStatus(t, service)
+	if status.State != domain.ConnectionStatusFailed || status.Mode != oldRequest.Mode || status.Route != oldRequest.Route {
+		t.Fatalf("status = %#v, want failed previous-session identity", status)
+	}
+}
+
+func TestReplacementRollbackContextIsServiceBounded(t *testing.T) {
+	oldProcess := newFakeProcess(true)
+	stopTimeout := 40 * time.Millisecond
+	runner := newFakeRunner()
+	runner.start = func(call int, ctx context.Context, _ *core.PreparedConfig) (core.Process, error) {
+		switch call {
+		case 1:
+			return oldProcess, nil
+		case 2:
+			return nil, core.ErrCoreStartFailed
+		case 3:
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(4 * stopTimeout):
+				return nil, errors.New("rollback context was not bounded")
+			}
+		default:
+			return nil, errors.New("unexpected start")
+		}
+	}
+	service := newTestService(t, runner, stopTimeout)
 	if _, err := service.Connect(context.Background(), connectionRequest(domain.ConnectionModeTUN, domain.RouteModeGlobal)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := service.Connect(context.Background(), connectionRequest(domain.ConnectionModeTUN, domain.RouteModeRule)); !errors.Is(err, rpc.ErrProcessFailure) {
-		t.Fatalf("replacement error = %v, want ErrProcessFailure", err)
+
+	started := time.Now()
+	if _, err := service.Connect(context.Background(), connectionRequest(domain.ConnectionModeTUN, domain.RouteModeRule)); !errors.Is(err, rpc.ErrRollbackFailure) {
+		t.Fatalf("replacement error = %v, want ErrRollbackFailure", err)
 	}
-	if status := mustServiceStatus(t, service); status.State != domain.ConnectionStatusFailed {
-		t.Fatalf("status = %#v, want failed", status)
+	if elapsed := time.Since(started); elapsed > 2*stopTimeout+50*time.Millisecond {
+		t.Fatalf("rollback returned after %s, want bounded by service timeout %s", elapsed, stopTimeout)
 	}
+}
+
+func TestTimedOutRollbackProcessRemainsTrackedUntilWait(t *testing.T) {
+	oldProcess := newFakeProcess(true)
+	lateRollback := newStubbornFakeProcess()
+	runner := newFakeRunner()
+	runner.start = func(call int, ctx context.Context, _ *core.PreparedConfig) (core.Process, error) {
+		switch call {
+		case 1:
+			return oldProcess, nil
+		case 2:
+			return nil, core.ErrCoreStartFailed
+		case 3:
+			<-ctx.Done()
+			return lateRollback, nil
+		default:
+			return nil, errors.New("unexpected start")
+		}
+	}
+	service := newTestService(t, runner, 50*time.Millisecond)
+	oldRequest := connectionRequest(domain.ConnectionModeTUN, domain.RouteModeGlobal)
+	if _, err := service.Connect(context.Background(), oldRequest); err != nil {
+		t.Fatal(err)
+	}
+
+	status, err := service.Connect(context.Background(), connectionRequest(domain.ConnectionModeTUN, domain.RouteModeRule))
+	if !errors.Is(err, rpc.ErrRollbackFailure) || !errors.Is(err, rpc.ErrProcessStuck) {
+		lateRollback.exit(nil)
+		t.Fatalf("replacement error = %v, want rollback failure and process stuck", err)
+	}
+	if status.State != domain.ConnectionStatusDisconnecting || status.Mode != oldRequest.Mode || status.Route != oldRequest.Route {
+		lateRollback.exit(nil)
+		t.Fatalf("timed-out rollback status = %#v, want previous session disconnecting", status)
+	}
+	if service.active == nil || service.active.process != lateRollback {
+		lateRollback.exit(nil)
+		t.Fatal("timed-out rollback process was not tracked")
+	}
+
+	lateRollback.exit(nil)
+	waitForStatus(t, service, domain.ConnectionStatusFailed)
 }
 
 func TestStopSessionReturnsCallerCancellationWhenDoneIsAlsoReady(t *testing.T) {
@@ -305,7 +667,7 @@ func TestStopSessionReturnsCallerCancellationWhenDoneIsAlsoReady(t *testing.T) {
 	}
 }
 
-func TestDisconnectCancellationKillsAndReturnsImmediately(t *testing.T) {
+func TestDisconnectCancellationWaitsForProcessExitBeforeRetiring(t *testing.T) {
 	process := newStubbornFakeProcess()
 	process.termObserved = make(chan struct{})
 	process.killObserved = make(chan struct{})
@@ -342,81 +704,33 @@ func TestDisconnectCancellationKillsAndReturnsImmediately(t *testing.T) {
 	}
 	select {
 	case result := <-done:
+		process.exit(nil)
+		t.Fatalf("Disconnect() retired before Wait completed: %#v, %v", result.status, result.err)
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	process.exit(nil)
+	select {
+	case result := <-done:
 		if !errors.Is(result.err, context.Canceled) {
 			t.Fatalf("Disconnect() error = %v, want context.Canceled", result.err)
 		}
 		if result.status.State != domain.ConnectionStatusDisconnected {
-			t.Fatalf("Disconnect() status = %#v, want disconnected", result.status)
+			t.Fatalf("Disconnect() status = %#v, want disconnected after Wait", result.status)
 		}
-	case <-time.After(100 * time.Millisecond):
-		process.exit(nil)
-		<-done
-		t.Fatal("Disconnect() waited after killing a canceled session")
-	}
-	if process.killCount() != 1 {
-		t.Fatalf("Kill calls = %d, want 1", process.killCount())
-	}
-	process.exit(nil)
-}
-
-func TestDisconnectReturnsImmediatelyAfterStopTimeoutKill(t *testing.T) {
-	process := newStubbornFakeProcess()
-	process.termObserved = make(chan struct{})
-	process.killObserved = make(chan struct{})
-	runner := newFakeRunner()
-	runner.start = func(int, context.Context, *core.PreparedConfig) (core.Process, error) { return process, nil }
-	stopTimeout := 100 * time.Millisecond
-	service := newTestService(t, runner, stopTimeout)
-	if _, err := service.Connect(context.Background(), connectionRequest(domain.ConnectionModeTUN, domain.RouteModeGlobal)); err != nil {
-		t.Fatal(err)
-	}
-
-	type result struct {
-		status rpc.SessionStatus
-		err    error
-	}
-	done := make(chan result, 1)
-	go func() {
-		status, err := service.Disconnect(context.Background())
-		done <- result{status: status, err: err}
-	}()
-	select {
-	case <-process.termObserved:
 	case <-time.After(time.Second):
-		process.exit(nil)
-		t.Fatal("Disconnect() did not send SIGTERM")
-	}
-	select {
-	case <-process.killObserved:
-	case <-time.After(2 * stopTimeout):
-		process.exit(nil)
-		<-done
-		t.Fatal("Disconnect() did not kill after the stop timeout")
-	}
-	select {
-	case result := <-done:
-		if result.err != nil {
-			t.Fatalf("Disconnect() error = %v, want successful kill dispatch", result.err)
-		}
-		if result.status.State != domain.ConnectionStatusDisconnected {
-			t.Fatalf("Disconnect() status = %#v, want disconnected", result.status)
-		}
-	case <-time.After(40 * time.Millisecond):
-		process.exit(nil)
-		<-done
-		t.Fatal("Disconnect() started a second wait after Kill")
+		t.Fatal("Disconnect() did not return after Wait completed")
 	}
 	if process.killCount() != 1 {
 		t.Fatalf("Kill calls = %d, want 1", process.killCount())
 	}
-	process.exit(nil)
 }
 
-func TestDisconnectTermsWaitsThenKillsAndIsIdempotent(t *testing.T) {
-	process := newFakeProcess(false)
+func TestDisconnectReturnsProcessStuckAndKeepsTrackingSession(t *testing.T) {
+	process := newStubbornFakeProcess()
 	runner := newFakeRunner()
 	runner.start = func(int, context.Context, *core.PreparedConfig) (core.Process, error) { return process, nil }
-	stopTimeout := 25 * time.Millisecond
+	stopTimeout := 80 * time.Millisecond
 	service := newTestService(t, runner, stopTimeout)
 	if _, err := service.Connect(context.Background(), connectionRequest(domain.ConnectionModeTUN, domain.RouteModeGlobal)); err != nil {
 		t.Fatal(err)
@@ -424,11 +738,59 @@ func TestDisconnectTermsWaitsThenKillsAndIsIdempotent(t *testing.T) {
 
 	started := time.Now()
 	status, err := service.Disconnect(context.Background())
+	elapsed := time.Since(started)
+	if !errors.Is(err, rpc.ErrProcessStuck) {
+		process.exit(nil)
+		t.Fatalf("Disconnect() error = %v, want ErrProcessStuck", err)
+	}
+	if elapsed < stopTimeout || elapsed > stopTimeout+150*time.Millisecond {
+		process.exit(nil)
+		t.Fatalf("Disconnect() elapsed = %s, want one total deadline near %s", elapsed, stopTimeout)
+	}
+	if status.State != domain.ConnectionStatusDisconnecting {
+		process.exit(nil)
+		t.Fatalf("Disconnect() status = %#v, want disconnecting while Wait remains open", status)
+	}
+	if service.active == nil || service.active.process != process {
+		process.exit(nil)
+		t.Fatal("Disconnect() stopped tracking process before Wait completed")
+	}
+	if process.killCount() != 1 {
+		process.exit(nil)
+		t.Fatalf("Kill calls = %d, want 1", process.killCount())
+	}
+
+	if _, err := service.Connect(context.Background(), connectionRequest(domain.ConnectionModeTUN, domain.RouteModeRule)); !errors.Is(err, rpc.ErrProcessStuck) {
+		process.exit(nil)
+		t.Fatalf("replacement while old Wait is open = %v, want ErrProcessStuck", err)
+	}
+	if got := runner.startCount(); got != 1 {
+		process.exit(nil)
+		t.Fatalf("Start calls while old Wait is open = %d, want 1", got)
+	}
+
+	process.exit(nil)
+	waitForStatus(t, service, domain.ConnectionStatusDisconnected)
+}
+
+func TestDisconnectUsesGraceAndKillWithinOneTotalDeadline(t *testing.T) {
+	process := newFakeProcess(false)
+	runner := newFakeRunner()
+	runner.start = func(int, context.Context, *core.PreparedConfig) (core.Process, error) { return process, nil }
+	stopTimeout := 40 * time.Millisecond
+	service := newTestService(t, runner, stopTimeout)
+	if _, err := service.Connect(context.Background(), connectionRequest(domain.ConnectionModeTUN, domain.RouteModeGlobal)); err != nil {
+		t.Fatal(err)
+	}
+
+	started := time.Now()
+	status, err := service.Disconnect(context.Background())
+	elapsed := time.Since(started)
 	if err != nil {
 		t.Fatalf("Disconnect() failed: %v", err)
 	}
-	if time.Since(started) < stopTimeout {
-		t.Fatal("Disconnect() killed before graceful timeout elapsed")
+	if elapsed < stopTimeout/2 || elapsed > stopTimeout+100*time.Millisecond {
+		t.Fatalf("Disconnect() elapsed = %s, want graceful phase and total deadline %s", elapsed, stopTimeout)
 	}
 	if status.State != domain.ConnectionStatusDisconnected {
 		t.Fatalf("Disconnect() status = %#v, want disconnected", status)
@@ -465,8 +827,9 @@ func TestUnexpectedExitUpdatesStatusWithoutLeakingOutput(t *testing.T) {
 	}
 }
 
-func TestOldGenerationExitCannotClobberReplacementStatus(t *testing.T) {
+func TestReplacementWaitsForOldExitAndOldMonitorCannotClobberStatus(t *testing.T) {
 	oldProcess := newStubbornFakeProcess()
+	oldProcess.killObserved = make(chan struct{})
 	newProcess := newFakeProcess(false)
 	runner := newFakeRunner()
 	runner.start = func(call int, _ context.Context, _ *core.PreparedConfig) (core.Process, error) {
@@ -475,18 +838,46 @@ func TestOldGenerationExitCannotClobberReplacementStatus(t *testing.T) {
 		}
 		return newProcess, nil
 	}
-	service := newTestService(t, runner, 50*time.Millisecond)
+	service := newTestService(t, runner, 120*time.Millisecond)
 	if _, err := service.Connect(context.Background(), connectionRequest(domain.ConnectionModeTUN, domain.RouteModeGlobal)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := service.Connect(context.Background(), connectionRequest(domain.ConnectionModeTUN, domain.RouteModeRule)); err != nil {
-		t.Fatal(err)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := service.Connect(context.Background(), connectionRequest(domain.ConnectionModeTUN, domain.RouteModeRule))
+		done <- err
+	}()
+	select {
+	case <-oldProcess.killObserved:
+	case <-time.After(time.Second):
+		oldProcess.exit(nil)
+		t.Fatal("replacement did not reach kill phase")
 	}
-	oldProcess.exit(errors.New("late old generation exit"))
 	time.Sleep(20 * time.Millisecond)
+	if got := runner.startCount(); got != 1 {
+		oldProcess.exit(nil)
+		t.Fatalf("Start calls before old Wait completed = %d, want 1", got)
+	}
+	select {
+	case err := <-done:
+		oldProcess.exit(nil)
+		t.Fatalf("replacement returned before old Wait completed: %v", err)
+	default:
+	}
+
+	oldProcess.exit(errors.New("old generation exit"))
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("replacement Connect() failed: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("replacement did not start after old Wait completed")
+	}
 	status := mustServiceStatus(t, service)
 	if status.State != domain.ConnectionStatusConnected || status.Route != domain.RouteModeRule {
-		t.Fatalf("stale process exit changed replacement status: %#v", status)
+		t.Fatalf("old monitor changed replacement status: %#v", status)
 	}
 }
 
@@ -516,6 +907,71 @@ func TestStartedProcessUsesServiceLifetimeContext(t *testing.T) {
 	case <-startedContext.Done():
 	case <-time.After(time.Second):
 		t.Fatal("service lifetime context was not canceled on Close")
+	}
+}
+
+func TestServiceCloseWaitsForMonitorBeforeClosingRunner(t *testing.T) {
+	process := newFakeProcess(true)
+	runner := newFakeRunner()
+	runner.start = func(int, context.Context, *core.PreparedConfig) (core.Process, error) { return process, nil }
+	var service *Service
+	runner.close = func() error {
+		select {
+		case <-service.gate:
+			service.gate <- struct{}{}
+			return nil
+		default:
+			return errors.New("runner closed while monitor was blocked by service gate")
+		}
+	}
+	service = newTestService(t, runner, 80*time.Millisecond)
+	if _, err := service.Connect(context.Background(), connectionRequest(domain.ConnectionModeTUN, domain.RouteModeGlobal)); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := service.Close(); err != nil {
+		t.Fatalf("Close() failed: %v", err)
+	}
+	if runner.closeCount() != 1 {
+		t.Fatalf("runner Close calls = %d, want 1 after monitor completion", runner.closeCount())
+	}
+}
+
+func TestServiceCloseBoundsMonitorWaitAndDefersRunnerClose(t *testing.T) {
+	process := newStubbornFakeProcess()
+	runner := newFakeRunner()
+	runner.start = func(int, context.Context, *core.PreparedConfig) (core.Process, error) { return process, nil }
+	stopTimeout := 80 * time.Millisecond
+	service := newTestService(t, runner, stopTimeout)
+	if _, err := service.Connect(context.Background(), connectionRequest(domain.ConnectionModeTUN, domain.RouteModeGlobal)); err != nil {
+		t.Fatal(err)
+	}
+
+	started := time.Now()
+	if err := service.Close(); !errors.Is(err, rpc.ErrProcessStuck) {
+		process.exit(nil)
+		t.Fatalf("Close() error = %v, want ErrProcessStuck", err)
+	}
+	if elapsed := time.Since(started); elapsed > stopTimeout+50*time.Millisecond {
+		process.exit(nil)
+		t.Fatalf("Close() took %s, want the single total stop deadline %s", elapsed, stopTimeout)
+	}
+	if got := runner.closeCount(); got != 0 {
+		process.exit(nil)
+		t.Fatalf("runner Close calls before monitor exit = %d, want 0", got)
+	}
+	if service.active == nil || service.active.process != process {
+		process.exit(nil)
+		t.Fatal("Close() stopped tracking process whose Wait is still open")
+	}
+
+	process.exit(nil)
+	deadline := time.Now().Add(time.Second)
+	for runner.closeCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := runner.closeCount(); got != 1 {
+		t.Fatalf("runner Close calls after late monitor exit = %d, want 1", got)
 	}
 }
 
@@ -647,6 +1103,7 @@ type fakeRunner struct {
 
 	check func(int, context.Context, *core.PreparedConfig) error
 	start func(int, context.Context, *core.PreparedConfig) (core.Process, error)
+	close func() error
 }
 
 func newFakeRunner() *fakeRunner { return &fakeRunner{} }
@@ -687,8 +1144,12 @@ func (runner *fakeRunner) Start(ctx context.Context, prepared *core.PreparedConf
 
 func (runner *fakeRunner) Close() error {
 	runner.mu.Lock()
-	defer runner.mu.Unlock()
 	runner.closeCalls++
+	closeRunner := runner.close
+	runner.mu.Unlock()
+	if closeRunner != nil {
+		return closeRunner()
+	}
 	return nil
 }
 

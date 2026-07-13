@@ -100,7 +100,7 @@ func (request ConnectionRequest) validate() error {
 }
 
 func validateIdentity(name string, value int) error {
-	if value < 0 || uint64(value) > math.MaxUint32 {
+	if value < 0 || uint64(value) >= math.MaxUint32 {
 		return fmt.Errorf("%s is invalid", name)
 	}
 	return nil
