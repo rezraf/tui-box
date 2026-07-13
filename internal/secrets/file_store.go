@@ -6,49 +6,46 @@ import (
 	"errors"
 	"io"
 	"os"
-	"path/filepath"
-	"sync"
+	"unicode/utf8"
 
 	"github.com/rezraf/tui-box/internal/filelock"
 	"github.com/rezraf/tui-box/internal/securepath"
+	"golang.org/x/sys/unix"
 )
 
 const (
 	fallbackFileName     = "secrets.json"
 	fallbackLockFileName = ".secrets.lock"
+	maxSecretBytes       = 64 << 10
 	maxFallbackFileBytes = 10 << 20
 )
 
 var errFallbackStore = errors.New("local secret store operation failed")
 
 type fileStore struct {
-	directory string
-	path      string
-	lockPath  string
-	mu        sync.Mutex
+	root *os.Root
 }
 
 func newFileStore(directory string) (*fileStore, error) {
-	if err := ensurePrivateDirectory(directory); err != nil {
+	root, err := securepath.OpenPrivateRoot(directory)
+	if err != nil {
 		return nil, errFallbackStore
 	}
-	path := filepath.Join(directory, fallbackFileName)
-	if err := validatePrivateFileIfPresent(path); err != nil {
+	if err := validatePrivateFileIfPresent(root, fallbackFileName); err != nil {
+		_ = root.Close()
 		return nil, errFallbackStore
 	}
-	return &fileStore{directory: directory, path: path, lockPath: filepath.Join(directory, fallbackLockFileName)}, nil
+	return &fileStore{root: root}, nil
 }
 
 func (store *fileStore) Get(ctx context.Context, key string) (string, error) {
 	if !validSecretKey(key) {
 		return "", errors.New("secret key is invalid")
 	}
-	store.mu.Lock()
-	defer store.mu.Unlock()
 	if err := contextError(ctx); err != nil {
 		return "", err
 	}
-	lock, err := store.acquireFileLock()
+	lock, err := store.acquireFileLock(ctx)
 	if err != nil {
 		return "", err
 	}
@@ -68,12 +65,13 @@ func (store *fileStore) Set(ctx context.Context, key, secret string) error {
 	if !validSecretKey(key) {
 		return errors.New("secret key is invalid")
 	}
-	store.mu.Lock()
-	defer store.mu.Unlock()
+	if len(secret) > maxSecretBytes || !utf8.ValidString(secret) {
+		return errFallbackStore
+	}
 	if err := contextError(ctx); err != nil {
 		return err
 	}
-	lock, err := store.acquireFileLock()
+	lock, err := store.acquireFileLock(ctx)
 	if err != nil {
 		return err
 	}
@@ -90,12 +88,10 @@ func (store *fileStore) Delete(ctx context.Context, key string) error {
 	if !validSecretKey(key) {
 		return errors.New("secret key is invalid")
 	}
-	store.mu.Lock()
-	defer store.mu.Unlock()
 	if err := contextError(ctx); err != nil {
 		return err
 	}
-	lock, err := store.acquireFileLock()
+	lock, err := store.acquireFileLock(ctx)
 	if err != nil {
 		return err
 	}
@@ -111,36 +107,39 @@ func (store *fileStore) Delete(ctx context.Context, key string) error {
 	return store.writeLocked(values)
 }
 
-func (store *fileStore) acquireFileLock() (*filelock.Lock, error) {
-	if err := ensurePrivateDirectory(store.directory); err != nil {
+func (store *fileStore) acquireFileLock(ctx context.Context) (*filelock.Lock, error) {
+	if err := securepath.ValidatePrivateRoot(store.root); err != nil {
 		return nil, errFallbackStore
 	}
-	lock, err := filelock.Acquire(store.lockPath)
-	if err != nil {
-		return nil, errFallbackStore
+	lock, err := filelock.Acquire(ctx, store.root, fallbackLockFileName)
+	if err == nil {
+		return lock, nil
 	}
-	return lock, nil
+	if contextErr := contextOperationError(ctx, err); contextErr != nil {
+		return nil, contextErr
+	}
+	return nil, errFallbackStore
 }
 
 func (store *fileStore) loadLocked() (map[string]string, error) {
-	if err := ensurePrivateDirectory(store.directory); err != nil {
+	if err := securepath.ValidatePrivateRoot(store.root); err != nil {
 		return nil, errFallbackStore
 	}
-	info, err := os.Lstat(store.path)
+	info, err := store.root.Lstat(fallbackFileName)
 	if errors.Is(err, os.ErrNotExist) {
 		return make(map[string]string), nil
 	}
-	if err != nil || !validPrivateFileInfo(info) {
+	if err != nil || !validPrivateFileInfo(info) || info.Size() > maxFallbackFileBytes {
 		return nil, errFallbackStore
 	}
 
-	file, err := os.Open(store.path)
+	file, err := store.root.OpenFile(fallbackFileName, os.O_RDONLY|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, errFallbackStore
 	}
 	defer file.Close()
 	openedInfo, err := file.Stat()
-	if err != nil || !os.SameFile(info, openedInfo) || !validPrivateFileInfo(openedInfo) {
+	if err != nil || !os.SameFile(info, openedInfo) || !validPrivateFileInfo(openedInfo) || openedInfo.Size() > maxFallbackFileBytes {
 		return nil, errFallbackStore
 	}
 
@@ -155,14 +154,20 @@ func (store *fileStore) loadLocked() (map[string]string, error) {
 	if values == nil {
 		values = make(map[string]string)
 	}
+	if err := validateFallbackValues(values); err != nil {
+		return nil, errFallbackStore
+	}
 	return values, nil
 }
 
 func (store *fileStore) writeLocked(values map[string]string) error {
-	if err := ensurePrivateDirectory(store.directory); err != nil {
+	if err := securepath.ValidatePrivateRoot(store.root); err != nil {
 		return errFallbackStore
 	}
-	if err := validatePrivateFileIfPresent(store.path); err != nil {
+	if err := validatePrivateFileIfPresent(store.root, fallbackFileName); err != nil {
+		return errFallbackStore
+	}
+	if err := validateFallbackValues(values); err != nil {
 		return errFallbackStore
 	}
 	encoded, err := json.Marshal(values)
@@ -170,18 +175,15 @@ func (store *fileStore) writeLocked(values map[string]string) error {
 		return errFallbackStore
 	}
 	encoded = append(encoded, '\n')
+	if len(encoded) > maxFallbackFileBytes {
+		return errFallbackStore
+	}
 
-	temporary, err := os.CreateTemp(store.directory, "."+fallbackFileName+"-")
+	temporary, temporaryName, err := securepath.CreatePrivateTemp(store.root, "."+fallbackFileName+"-")
 	if err != nil {
 		return errFallbackStore
 	}
-	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
-
-	if err := temporary.Chmod(0o600); err != nil {
-		_ = temporary.Close()
-		return errFallbackStore
-	}
+	defer store.root.Remove(temporaryName)
 	if _, err := temporary.Write(encoded); err != nil {
 		_ = temporary.Close()
 		return errFallbackStore
@@ -190,27 +192,29 @@ func (store *fileStore) writeLocked(values map[string]string) error {
 		_ = temporary.Close()
 		return errFallbackStore
 	}
+	temporaryInfo, err := temporary.Stat()
+	if err != nil || !validPrivateFileInfo(temporaryInfo) || temporaryInfo.Size() != int64(len(encoded)) {
+		_ = temporary.Close()
+		return errFallbackStore
+	}
 	if err := temporary.Close(); err != nil {
 		return errFallbackStore
 	}
-	if err := os.Rename(temporaryPath, store.path); err != nil {
+	if err := store.root.Rename(temporaryName, fallbackFileName); err != nil {
 		return errFallbackStore
 	}
-	if err := syncDirectory(store.directory); err != nil {
+	finalInfo, err := store.root.Lstat(fallbackFileName)
+	if err != nil || !os.SameFile(temporaryInfo, finalInfo) || !validPrivateFileInfo(finalInfo) || finalInfo.Size() != int64(len(encoded)) {
 		return errFallbackStore
 	}
-	return nil
-}
-
-func ensurePrivateDirectory(directory string) error {
-	if err := securepath.EnsurePrivateDirectory(directory); err != nil {
+	if err := securepath.SyncRoot(store.root); err != nil {
 		return errFallbackStore
 	}
 	return nil
 }
 
-func validatePrivateFileIfPresent(path string) error {
-	info, err := os.Lstat(path)
+func validatePrivateFileIfPresent(root *os.Root, name string) error {
+	info, err := root.Lstat(name)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
@@ -221,7 +225,16 @@ func validatePrivateFileIfPresent(path string) error {
 }
 
 func validPrivateFileInfo(info os.FileInfo) bool {
-	return info.Mode().IsRegular() && info.Mode().Perm()&0o077 == 0
+	return info.Mode().IsRegular() && info.Mode().Perm() == 0o600
+}
+
+func validateFallbackValues(values map[string]string) error {
+	for key, secret := range values {
+		if !validSecretKey(key) || len(secret) > maxSecretBytes || !utf8.ValidString(secret) {
+			return errFallbackStore
+		}
+	}
+	return nil
 }
 
 func requireJSONEOF(decoder *json.Decoder) error {
@@ -232,20 +245,6 @@ func requireJSONEOF(decoder *json.Decoder) error {
 	return nil
 }
 
-func syncDirectory(directory string) error {
-	file, err := os.Open(directory)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-	return file.Sync()
-}
-
 func contextError(ctx context.Context) error {
-	select {
-	case <-ctx.Done():
-		return errors.New("secret operation canceled")
-	default:
-		return nil
-	}
+	return ctx.Err()
 }

@@ -35,6 +35,7 @@ func TestStoreUsesExplicitSchemaAndRestrictedPermissions(t *testing.T) {
 	if err := store.Save(want); err != nil {
 		t.Fatalf("Save() returned an unexpected error: %v", err)
 	}
+	want.Revision = 1
 	assertMode(t, directory, 0o700)
 	assertMode(t, filepath.Join(directory, StateLockFileName), 0o600)
 	path := filepath.Join(directory, StateFileName)
@@ -79,12 +80,15 @@ func TestStoreAtomicallyReplacesStateFile(t *testing.T) {
 		t.Fatalf("Stat() before replacement: %v", err)
 	}
 
-	second := first
-	second.Subscriptions = append([]domain.Subscription(nil), first.Subscriptions...)
+	second, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load() before replacement: %v", err)
+	}
 	second.Subscriptions[0].Name = "Renamed"
 	if err := store.Save(second); err != nil {
 		t.Fatalf("second Save() returned an unexpected error: %v", err)
 	}
+	second.Revision++
 	after, err := os.Stat(path)
 	if err != nil {
 		t.Fatalf("Stat() after replacement: %v", err)
@@ -266,6 +270,7 @@ func TestCommitSubscriptionRefreshPreservesLastKnownGoodCache(t *testing.T) {
 	if err := store.Save(original); err != nil {
 		t.Fatalf("Save() returned an unexpected error: %v", err)
 	}
+	original.Revision = 1
 	path := filepath.Join(directory, StateFileName)
 	before, err := os.Stat(path)
 	if err != nil {
@@ -310,6 +315,7 @@ func TestCommitSubscriptionRefreshReplacesOnlyTargetSubscriptionTransactionally(
 	if err := store.Save(original); err != nil {
 		t.Fatalf("Save() returned an unexpected error: %v", err)
 	}
+	original.Revision = 1
 
 	invalid := []domain.Endpoint{testEndpoint("invalid", "subscription-a", "invalid host")}
 	committed, err := store.CommitSubscriptionRefresh("subscription-a", invalid, nil)
@@ -355,18 +361,25 @@ func TestStoreRejectsEncodedStateAboveLoadLimitBeforeWrite(t *testing.T) {
 	if err := store.Save(original); err != nil {
 		t.Fatalf("initial Save() returned an unexpected error: %v", err)
 	}
+	original.Revision = 1
 	path := filepath.Join(directory, StateFileName)
 	before, err := os.Stat(path)
 	if err != nil {
 		t.Fatalf("Stat() before oversized Save: %v", err)
 	}
 
-	if err := store.Save(oversizedValidSnapshot()); err == nil {
+	oversized := oversizedValidSnapshot()
+	oversized.Revision = original.Revision
+	saveErr := store.Save(oversized)
+	if saveErr == nil {
 		after, statErr := os.Stat(path)
 		if statErr != nil {
 			t.Fatalf("Stat() after oversized Save: %v", statErr)
 		}
 		t.Fatalf("Save() accepted encoded state of %d bytes, limit is %d", after.Size(), maxStateFileBytes)
+	}
+	if !errors.Is(saveErr, errInvalidState) {
+		t.Fatalf("oversized Save() error = %v, want errInvalidState", saveErr)
 	}
 
 	after, err := os.Stat(path)
@@ -440,6 +453,109 @@ func TestStoreEnforcesEndpointCountBoundary(t *testing.T) {
 	}
 }
 
+func TestStaleSaveConflictsAndUpdatePreservesBothChanges(t *testing.T) {
+	directory := filepath.Join(t.TempDir(), "state")
+	first, err := NewStore(directory)
+	if err != nil {
+		t.Fatalf("first NewStore() returned an unexpected error: %v", err)
+	}
+	second, err := NewStore(directory)
+	if err != nil {
+		t.Fatalf("second NewStore() returned an unexpected error: %v", err)
+	}
+	if err := first.Save(testSnapshot()); err != nil {
+		t.Fatalf("initial Save() returned an unexpected error: %v", err)
+	}
+
+	firstView, err := first.Load()
+	if err != nil {
+		t.Fatalf("first Load(): %v", err)
+	}
+	secondView, err := second.Load()
+	if err != nil {
+		t.Fatalf("second Load(): %v", err)
+	}
+	if firstView.Revision == 0 || firstView.Revision != secondView.Revision {
+		t.Fatalf("loaded revisions = %d and %d, want one shared nonzero revision", firstView.Revision, secondView.Revision)
+	}
+
+	firstView.Subscriptions[0].Name = "Changed by first"
+	if err := first.Save(firstView); err != nil {
+		t.Fatalf("first Save() returned an unexpected error: %v", err)
+	}
+	secondView.Subscriptions[1].Name = "Changed by stale second"
+	if err := second.Save(secondView); !errors.Is(err, ErrStateConflict) {
+		t.Fatalf("stale Save() error = %v, want ErrStateConflict", err)
+	}
+
+	if err := second.Update(func(snapshot *Snapshot) error {
+		snapshot.Subscriptions[1].Name = "Changed by update"
+		return nil
+	}); err != nil {
+		t.Fatalf("Update() returned an unexpected error: %v", err)
+	}
+	got, err := first.Load()
+	if err != nil {
+		t.Fatalf("final Load(): %v", err)
+	}
+	if got.Subscriptions[0].Name != "Changed by first" || got.Subscriptions[1].Name != "Changed by update" {
+		t.Fatalf("final names = %q and %q, want both independent changes", got.Subscriptions[0].Name, got.Subscriptions[1].Name)
+	}
+}
+
+func TestUpdateRejectsRevisionMutation(t *testing.T) {
+	store, err := NewStore(filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatalf("NewStore() returned an unexpected error: %v", err)
+	}
+	if err := store.Save(testSnapshot()); err != nil {
+		t.Fatalf("initial Save() returned an unexpected error: %v", err)
+	}
+	if err := store.Update(func(snapshot *Snapshot) error {
+		snapshot.Revision++
+		return nil
+	}); err == nil {
+		t.Fatal("Update() accepted callback revision mutation")
+	}
+	got, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load() after rejected Update: %v", err)
+	}
+	if got.Revision != 1 {
+		t.Fatalf("revision after rejected Update = %d, want 1", got.Revision)
+	}
+}
+
+func TestStoreOperationsRemainAnchoredAfterDirectoryPathReplacement(t *testing.T) {
+	base := t.TempDir()
+	directory := filepath.Join(base, "state")
+	store, err := NewStore(directory)
+	if err != nil {
+		t.Fatalf("NewStore() returned an unexpected error: %v", err)
+	}
+
+	moved := filepath.Join(base, "moved")
+	if err := os.Rename(directory, moved); err != nil {
+		t.Fatalf("Rename() state directory: %v", err)
+	}
+	attacker := filepath.Join(base, "attacker")
+	if err := os.Mkdir(attacker, 0o700); err != nil {
+		t.Fatalf("Mkdir() attacker directory: %v", err)
+	}
+	if err := os.Symlink(attacker, directory); err != nil {
+		t.Fatalf("Symlink() replacement: %v", err)
+	}
+
+	if err := store.Save(testSnapshot()); err != nil {
+		t.Fatalf("Save() through held root returned an unexpected error: %v", err)
+	}
+	assertMode(t, filepath.Join(moved, StateFileName), 0o600)
+	assertMode(t, filepath.Join(moved, StateLockFileName), 0o600)
+	if _, err := os.Stat(filepath.Join(attacker, StateFileName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("replacement directory received state write: %v", err)
+	}
+}
+
 func TestIndependentStoresDoNotLoseConcurrentRefreshes(t *testing.T) {
 	directory := filepath.Join(t.TempDir(), "state")
 	first, err := NewStore(directory)
@@ -466,6 +582,11 @@ func TestIndependentStoresDoNotLoseConcurrentRefreshes(t *testing.T) {
 	original.Endpoints = append(original.Endpoints, testEndpoints(500, "subscription-c")...)
 
 	for attempt := 0; attempt < 25; attempt++ {
+		current, err := first.Load()
+		if err != nil {
+			t.Fatalf("attempt %d reset Load(): %v", attempt, err)
+		}
+		original.Revision = current.Revision
 		if err := first.Save(original); err != nil {
 			t.Fatalf("attempt %d reset Save(): %v", attempt, err)
 		}

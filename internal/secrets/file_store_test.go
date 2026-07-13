@@ -3,6 +3,7 @@ package secrets
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -174,6 +175,151 @@ func TestIndependentFileStoresDoNotLoseConcurrentUpdates(t *testing.T) {
 	}
 }
 
+func TestFileStoreEnforcesPerSecretSizeBoundary(t *testing.T) {
+	directory := filepath.Join(t.TempDir(), "secrets")
+	store, err := newFileStore(directory)
+	if err != nil {
+		t.Fatalf("newFileStore() returned an unexpected error: %v", err)
+	}
+	atLimit := strings.Repeat("x", maxSecretBytes)
+	if err := store.Set(context.Background(), "at-limit", atLimit); err != nil {
+		t.Fatalf("Set() rejected %d-byte secret: %v", maxSecretBytes, err)
+	}
+	got, err := store.Get(context.Background(), "at-limit")
+	if err != nil {
+		t.Fatalf("Get() at boundary returned an unexpected error: %v", err)
+	}
+	if got != atLimit {
+		t.Fatalf("Get() returned %d bytes, want %d", len(got), len(atLimit))
+	}
+
+	if err := store.Set(context.Background(), "over-limit", atLimit+"x"); err == nil {
+		t.Fatalf("Set() accepted %d-byte secret", maxSecretBytes+1)
+	}
+	if _, err := store.Get(context.Background(), "over-limit"); !errors.Is(err, ErrSecretNotFound) {
+		t.Fatalf("Get() rejected secret error = %v, want ErrSecretNotFound", err)
+	}
+}
+
+func TestFileStoreRejectsSecretThatCannotRoundTripThroughJSON(t *testing.T) {
+	store, err := newFileStore(filepath.Join(t.TempDir(), "secrets"))
+	if err != nil {
+		t.Fatalf("newFileStore() returned an unexpected error: %v", err)
+	}
+	if err := store.Set(context.Background(), "invalid", string([]byte{0xff})); err == nil {
+		t.Fatal("Set() accepted invalid UTF-8 secret")
+	}
+	if _, err := store.Get(context.Background(), "invalid"); !errors.Is(err, ErrSecretNotFound) {
+		t.Fatalf("Get() rejected secret error = %v, want ErrSecretNotFound", err)
+	}
+}
+
+func TestFileStoreEnforcesEncodedFileSizeBoundaryBeforeWrite(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		targetSize int
+		wantError  bool
+	}{
+		{name: "exact limit is readable", targetSize: maxFallbackFileBytes},
+		{name: "one byte above is rejected", targetSize: maxFallbackFileBytes + 1, wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			directory := filepath.Join(t.TempDir(), "secrets")
+			store, err := newFileStore(directory)
+			if err != nil {
+				t.Fatalf("newFileStore() returned an unexpected error: %v", err)
+			}
+			values, target := fallbackValuesForEncodedSize(t, test.targetSize, "boundary")
+			encoded, err := json.Marshal(values)
+			if err != nil {
+				t.Fatalf("json.Marshal() fixture: %v", err)
+			}
+			encoded = append(encoded, '\n')
+			path := filepath.Join(directory, fallbackFileName)
+			if err := os.WriteFile(path, encoded, 0o600); err != nil {
+				t.Fatalf("WriteFile() fixture: %v", err)
+			}
+
+			before, err := os.Stat(path)
+			if err != nil {
+				t.Fatalf("Stat() before Set: %v", err)
+			}
+			err = store.Set(context.Background(), "boundary", target)
+			if test.wantError {
+				if err == nil {
+					t.Fatalf("Set() accepted encoded file above %d bytes", maxFallbackFileBytes)
+				}
+				after, statErr := os.Stat(path)
+				if statErr != nil {
+					t.Fatalf("Stat() after rejected Set: %v", statErr)
+				}
+				if !os.SameFile(before, after) {
+					t.Fatal("rejected Set() replaced the fallback file")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Set() at encoded boundary returned an unexpected error: %v", err)
+			}
+			info, err := os.Stat(path)
+			if err != nil {
+				t.Fatalf("Stat() boundary file: %v", err)
+			}
+			if info.Size() != int64(maxFallbackFileBytes) {
+				t.Fatalf("fallback file size = %d, want %d", info.Size(), maxFallbackFileBytes)
+			}
+			got, err := store.Get(context.Background(), "boundary")
+			if err != nil {
+				t.Fatalf("Get() encoded boundary: %v", err)
+			}
+			if got != target {
+				t.Fatalf("Get() boundary secret length = %d, want %d", len(got), len(target))
+			}
+		})
+	}
+}
+
+func TestFileStoreOperationsRemainAnchoredAfterDirectoryPathReplacement(t *testing.T) {
+	base := t.TempDir()
+	directory := filepath.Join(base, "secrets")
+	store, err := newFileStore(directory)
+	if err != nil {
+		t.Fatalf("newFileStore() returned an unexpected error: %v", err)
+	}
+	moved := filepath.Join(base, "moved")
+	if err := os.Rename(directory, moved); err != nil {
+		t.Fatalf("Rename() secret directory: %v", err)
+	}
+	attacker := filepath.Join(base, "attacker")
+	if err := os.Mkdir(attacker, 0o700); err != nil {
+		t.Fatalf("Mkdir() attacker directory: %v", err)
+	}
+	if err := os.Symlink(attacker, directory); err != nil {
+		t.Fatalf("Symlink() replacement: %v", err)
+	}
+
+	if err := store.Set(context.Background(), "subscription-1", "secret"); err != nil {
+		t.Fatalf("Set() through held root returned an unexpected error: %v", err)
+	}
+	assertFileMode(t, filepath.Join(moved, fallbackFileName), 0o600)
+	assertFileMode(t, filepath.Join(moved, fallbackLockFileName), 0o600)
+	if _, err := os.Stat(filepath.Join(attacker, fallbackFileName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("replacement directory received fallback write: %v", err)
+	}
+}
+
+func TestFileStorePreservesCanceledContextIdentity(t *testing.T) {
+	store, err := newFileStore(filepath.Join(t.TempDir(), "secrets"))
+	if err != nil {
+		t.Fatalf("newFileStore() returned an unexpected error: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := store.Set(ctx, "subscription-1", "secret"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Set() error = %v, want context.Canceled", err)
+	}
+}
+
 func TestFileStoreRefusesSymlinkedAncestor(t *testing.T) {
 	t.Parallel()
 
@@ -214,6 +360,51 @@ func TestFileStoreErrorsDoNotLeakStoredSecrets(t *testing.T) {
 	for _, sensitive := range []string{secret, "password", "example.com", "query-secret"} {
 		if strings.Contains(err.Error(), sensitive) {
 			t.Fatalf("file error leaked %q: %v", sensitive, err)
+		}
+	}
+}
+
+func fallbackValuesForEncodedSize(t *testing.T, targetSize int, targetKey string) (map[string]string, string) {
+	t.Helper()
+	values := make(map[string]string)
+	encodedSize := len("{}\n")
+	for index := 0; ; index++ {
+		targetOverhead := len(targetKey) + 6
+		if len(values) == 0 {
+			targetOverhead = len(targetKey) + 8
+		}
+		targetLength := targetSize - encodedSize - targetOverhead
+		if targetLength > 0 && targetLength <= maxSecretBytes {
+			target := strings.Repeat("t", targetLength)
+			withTarget := make(map[string]string, len(values)+1)
+			for key, value := range values {
+				withTarget[key] = value
+			}
+			withTarget[targetKey] = target
+			encoded, err := json.Marshal(withTarget)
+			if err != nil {
+				t.Fatalf("json.Marshal() boundary fixture: %v", err)
+			}
+			if len(encoded)+1 != targetSize {
+				t.Fatalf("boundary fixture size = %d, want %d", len(encoded)+1, targetSize)
+			}
+			return values, target
+		}
+
+		key := fmt.Sprintf("filler-%04d", index)
+		desiredTargetLength := maxSecretBytes / 2
+		valueLength := targetLength - desiredTargetLength - len(key) - 6
+		if valueLength > maxSecretBytes {
+			valueLength = maxSecretBytes
+		}
+		if valueLength <= 0 {
+			t.Fatalf("cannot construct %d-byte fallback fixture", targetSize)
+		}
+		values[key] = strings.Repeat("f", valueLength)
+		if len(values) == 1 {
+			encodedSize = len(key) + valueLength + 8
+		} else {
+			encodedSize += len(key) + valueLength + 6
 		}
 	}
 }

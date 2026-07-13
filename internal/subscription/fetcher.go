@@ -61,6 +61,9 @@ func (fetcher *Fetcher) Fetch(ctx context.Context, rawURL string) ([]byte, error
 		if response != nil && response.Body != nil {
 			_ = response.Body.Close()
 		}
+		if contextErr := fetchContextError(ctx, err); contextErr != nil {
+			return nil, contextErr
+		}
 		if errors.Is(err, errSubscriptionRedirectRejected) {
 			return nil, errSubscriptionRedirectRejected
 		}
@@ -77,12 +80,28 @@ func (fetcher *Fetcher) Fetch(ctx context.Context, rawURL string) ([]byte, error
 
 	body, err := io.ReadAll(io.LimitReader(response.Body, MaxSubscriptionResponseBytes+1))
 	if err != nil {
+		if contextErr := fetchContextError(ctx, err); contextErr != nil {
+			return nil, contextErr
+		}
 		return nil, errSubscriptionFetchFailed
 	}
 	if len(body) > MaxSubscriptionResponseBytes {
 		return nil, errSubscriptionResponseTooLarge
 	}
 	return body, nil
+}
+
+func fetchContextError(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	if errors.Is(err, context.Canceled) {
+		return context.Canceled
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return context.DeadlineExceeded
+	}
+	return nil
 }
 
 func checkSubscriptionRedirect(request *http.Request, via []*http.Request) error {

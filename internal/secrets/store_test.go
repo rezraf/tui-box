@@ -116,7 +116,7 @@ type deadlineRecordingRunner struct {
 	hasDeadline bool
 }
 
-func (runner *deadlineRecordingRunner) Run(ctx context.Context, executable string, arguments []string, stdin string) ([]byte, error) {
+func (runner *deadlineRecordingRunner) Run(ctx context.Context, executable string, arguments []string, stdin string) (CommandResult, error) {
 	runner.deadline, runner.hasDeadline = ctx.Deadline()
 	return runner.recordingRunner.Run(ctx, executable, arguments, stdin)
 }

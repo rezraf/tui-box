@@ -1,11 +1,15 @@
 package filelock
 
 import (
+	"context"
 	"errors"
 	"os"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
+
+const retryInterval = 5 * time.Millisecond
 
 var ErrInvalidLockFile = errors.New("lock file is invalid")
 
@@ -13,16 +17,18 @@ type Lock struct {
 	file *os.File
 }
 
-func Acquire(path string) (*Lock, error) {
-	file, created, err := open(path)
+func Acquire(ctx context.Context, root *os.Root, name string) (*Lock, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	file, created, err := open(root, name)
 	if err != nil {
 		return nil, err
 	}
-	removeOnError := created
+	acquired := false
 	defer func() {
-		if removeOnError {
+		if !acquired {
 			_ = file.Close()
-			_ = os.Remove(path)
 		}
 	}()
 
@@ -31,18 +37,22 @@ func Acquire(path string) (*Lock, error) {
 			return nil, err
 		}
 	}
-	if err := validate(path, file); err != nil {
+	if err := validate(root, name, file); err != nil {
 		return nil, err
 	}
-	if err := unix.Flock(int(file.Fd()), unix.LOCK_EX); err != nil {
+	if err := acquire(ctx, file); err != nil {
 		return nil, err
 	}
-	if err := validate(path, file); err != nil {
+	if err := ctx.Err(); err != nil {
+		_ = unix.Flock(int(file.Fd()), unix.LOCK_UN)
+		return nil, err
+	}
+	if err := validate(root, name, file); err != nil {
 		_ = unix.Flock(int(file.Fd()), unix.LOCK_UN)
 		return nil, err
 	}
 
-	removeOnError = false
+	acquired = true
 	return &Lock{file: file}, nil
 }
 
@@ -55,21 +65,46 @@ func (lock *Lock) Close() error {
 	return closeErr
 }
 
-func open(path string) (*os.File, bool, error) {
-	flags := unix.O_CREAT | unix.O_EXCL | unix.O_RDWR | unix.O_CLOEXEC | unix.O_NOFOLLOW
-	fileDescriptor, err := unix.Open(path, flags, 0o600)
+func open(root *os.Root, name string) (*os.File, bool, error) {
+	flags := os.O_CREATE | os.O_EXCL | os.O_RDWR | unix.O_NOFOLLOW
+	file, err := root.OpenFile(name, flags, 0o600)
 	created := err == nil
-	if errors.Is(err, unix.EEXIST) {
-		fileDescriptor, err = unix.Open(path, unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if errors.Is(err, os.ErrExist) {
+		file, err = root.OpenFile(name, os.O_RDWR|unix.O_NOFOLLOW, 0)
 	}
 	if err != nil {
 		return nil, false, err
 	}
-	return os.NewFile(uintptr(fileDescriptor), path), created, nil
+	return file, created, nil
 }
 
-func validate(path string, file *os.File) error {
-	pathInfo, err := os.Lstat(path)
+func acquire(ctx context.Context, file *os.File) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err := unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, unix.EWOULDBLOCK) && !errors.Is(err, unix.EAGAIN) {
+			return err
+		}
+
+		timer := time.NewTimer(retryInterval)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func validate(root *os.Root, name string, file *os.File) error {
+	pathInfo, err := root.Lstat(name)
 	if err != nil {
 		return err
 	}

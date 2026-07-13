@@ -1,6 +1,7 @@
 package secrets
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os/exec"
@@ -15,16 +16,40 @@ const (
 
 var errSecretCommandFailed = errors.New("credential store operation failed")
 
+type CommandResult struct {
+	Stdout   []byte
+	Stderr   []byte
+	ExitCode int
+}
+
 type CommandRunner interface {
-	Run(context.Context, string, []string, string) ([]byte, error)
+	Run(context.Context, string, []string, string) (CommandResult, error)
 }
 
 type execCommandRunner struct{}
 
-func (execCommandRunner) Run(ctx context.Context, executable string, arguments []string, stdin string) ([]byte, error) {
+func (execCommandRunner) Run(ctx context.Context, executable string, arguments []string, stdin string) (CommandResult, error) {
 	command := exec.CommandContext(ctx, executable, arguments...)
 	command.Stdin = strings.NewReader(stdin)
-	return command.Output()
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	command.Stdout = &stdout
+	command.Stderr = &stderr
+
+	err := command.Run()
+	result := CommandResult{Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}
+	if err == nil {
+		return result, nil
+	}
+	result.ExitCode = -1
+	var exitError *exec.ExitError
+	if errors.As(err, &exitError) {
+		result.ExitCode = exitError.ExitCode()
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return result, ctxErr
+	}
+	return result, err
 }
 
 type commandBackend int
@@ -56,31 +81,55 @@ func (store *commandStore) Get(ctx context.Context, key string) (string, error) 
 	if !validSecretKey(key) {
 		return "", errors.New("secret key is invalid")
 	}
-	output, err := store.runner.Run(ctx, store.executable, store.getArguments(key), "")
+	result, err := store.runner.Run(ctx, store.executable, store.getArguments(key), "")
 	if err != nil {
+		if contextErr := contextOperationError(ctx, err); contextErr != nil {
+			return "", contextErr
+		}
+		if store.isNotFound(result) {
+			return "", ErrSecretNotFound
+		}
 		return "", errSecretCommandFailed
 	}
-	return strings.TrimSuffix(strings.TrimSuffix(string(output), "\n"), "\r"), nil
+	return strings.TrimSuffix(strings.TrimSuffix(string(result.Stdout), "\n"), "\r"), nil
 }
 
 func (store *commandStore) Set(ctx context.Context, key, secret string) error {
 	if !validSecretKey(key) {
 		return errors.New("secret key is invalid")
 	}
-	if _, err := store.runner.Run(ctx, store.executable, store.setArguments(key), secret); err != nil {
-		return errSecretCommandFailed
+	_, err := store.runner.Run(ctx, store.executable, store.setArguments(key), secret)
+	if err == nil {
+		return nil
 	}
-	return nil
+	if contextErr := contextOperationError(ctx, err); contextErr != nil {
+		return contextErr
+	}
+	return errSecretCommandFailed
 }
 
 func (store *commandStore) Delete(ctx context.Context, key string) error {
 	if !validSecretKey(key) {
 		return errors.New("secret key is invalid")
 	}
-	if _, err := store.runner.Run(ctx, store.executable, store.deleteArguments(key), ""); err != nil {
-		return errSecretCommandFailed
+	result, err := store.runner.Run(ctx, store.executable, store.deleteArguments(key), "")
+	if err == nil {
+		return nil
 	}
-	return nil
+	if contextErr := contextOperationError(ctx, err); contextErr != nil {
+		return contextErr
+	}
+	if store.isNotFound(result) {
+		return nil
+	}
+	return errSecretCommandFailed
+}
+
+func (store *commandStore) isNotFound(result CommandResult) bool {
+	if store.backend == commandBackendMacOS {
+		return result.ExitCode == 44
+	}
+	return result.ExitCode == 1 && len(bytes.TrimSpace(result.Stdout)) == 0 && len(bytes.TrimSpace(result.Stderr)) == 0
 }
 
 func (store *commandStore) getArguments(key string) []string {
@@ -119,4 +168,17 @@ func validSecretKey(key string) bool {
 		return false
 	}
 	return true
+}
+
+func contextOperationError(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	if errors.Is(err, context.Canceled) {
+		return context.Canceled
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return context.DeadlineExceeded
+	}
+	return nil
 }

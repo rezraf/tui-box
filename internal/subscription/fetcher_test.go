@@ -2,6 +2,7 @@ package subscription
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -196,10 +197,52 @@ func TestFetcherHonorsShortPositiveTimeout(t *testing.T) {
 	if err == nil {
 		t.Fatal("Fetch() returned nil error, want timeout")
 	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Fetch() error = %v, want context.DeadlineExceeded identity", err)
+	}
 	if elapsed := time.Since(started); elapsed > time.Second {
 		t.Fatalf("Fetch() took %s, want configured short timeout", elapsed)
 	}
 	assertFetchErrorRedacted(t, err, server.URL, "slow", "token", "secret")
+}
+
+func TestFetcherPreservesContextErrorIdentity(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name string
+		ctx  func() (context.Context, context.CancelFunc)
+		want error
+	}{
+		{
+			name: "canceled",
+			ctx: func() (context.Context, context.CancelFunc) {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return ctx, func() {}
+			},
+			want: context.Canceled,
+		},
+		{
+			name: "deadline exceeded",
+			ctx: func() (context.Context, context.CancelFunc) {
+				return context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+			},
+			want: context.DeadlineExceeded,
+		},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			ctx, cancel := test.ctx()
+			defer cancel()
+			_, err := NewFetcher(nil).Fetch(ctx, "https://example.com/private?token=secret")
+			if !errors.Is(err, test.want) {
+				t.Fatalf("Fetch() error = %v, want %v identity", err, test.want)
+			}
+			assertFetchErrorRedacted(t, err, "example.com", "private", "token", "secret")
+		})
+	}
 }
 
 func TestFetcherReturnsGenericNonSuccessErrorAndClosesBody(t *testing.T) {

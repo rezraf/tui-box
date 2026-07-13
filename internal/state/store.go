@@ -1,19 +1,20 @@
 package state
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
 	"os"
-	"path/filepath"
 	"strings"
-	"sync"
 	"unicode"
 	"unicode/utf8"
 
 	"github.com/rezraf/tui-box/internal/domain"
 	"github.com/rezraf/tui-box/internal/filelock"
 	"github.com/rezraf/tui-box/internal/securepath"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -28,37 +29,35 @@ const (
 )
 
 var (
-	errStateStore   = errors.New("state store operation failed")
-	errInvalidState = errors.New("state file is invalid")
+	ErrStateConflict = errors.New("state revision conflict")
+	errStateStore    = errors.New("state store operation failed")
+	errInvalidState  = errors.New("state file is invalid")
 )
 
 type Snapshot struct {
 	SchemaVersion int                   `json:"schema_version"`
+	Revision      uint64                `json:"revision"`
 	Subscriptions []domain.Subscription `json:"subscriptions"`
 	Endpoints     []domain.Endpoint     `json:"endpoints"`
 }
 
 type Store struct {
-	directory string
-	path      string
-	lockPath  string
-	mu        sync.Mutex
+	root *os.Root
 }
 
 func NewStore(directory string) (*Store, error) {
-	if err := ensurePrivateStateDirectory(directory); err != nil {
+	root, err := securepath.OpenPrivateRoot(directory)
+	if err != nil {
 		return nil, errStateStore
 	}
-	path := filepath.Join(directory, StateFileName)
-	if err := validatePrivateStateFileIfPresent(path); err != nil {
+	if err := validatePrivateStateFileIfPresent(root); err != nil {
+		_ = root.Close()
 		return nil, errStateStore
 	}
-	return &Store{directory: directory, path: path, lockPath: filepath.Join(directory, StateLockFileName)}, nil
+	return &Store{root: root}, nil
 }
 
 func (store *Store) Load() (Snapshot, error) {
-	store.mu.Lock()
-	defer store.mu.Unlock()
 	lock, err := store.acquireFileLock()
 	if err != nil {
 		return Snapshot{}, err
@@ -71,13 +70,50 @@ func (store *Store) Save(snapshot Snapshot) error {
 	if err := validateSnapshot(snapshot); err != nil {
 		return errInvalidState
 	}
-	store.mu.Lock()
-	defer store.mu.Unlock()
 	lock, err := store.acquireFileLock()
 	if err != nil {
 		return err
 	}
 	defer lock.Close()
+	current, err := store.loadLocked()
+	if err != nil {
+		return err
+	}
+	if snapshot.Revision != current.Revision {
+		return ErrStateConflict
+	}
+	if err := incrementRevision(&snapshot); err != nil {
+		return err
+	}
+	return store.writeLocked(snapshot)
+}
+
+func (store *Store) Update(update func(*Snapshot) error) error {
+	if update == nil {
+		return errInvalidState
+	}
+	lock, err := store.acquireFileLock()
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	snapshot, err := store.loadLocked()
+	if err != nil {
+		return err
+	}
+	revision := snapshot.Revision
+	if err := update(&snapshot); err != nil {
+		return err
+	}
+	if snapshot.Revision != revision {
+		return errInvalidState
+	}
+	if err := validateSnapshot(snapshot); err != nil {
+		return errInvalidState
+	}
+	if err := incrementRevision(&snapshot); err != nil {
+		return err
+	}
 	return store.writeLocked(snapshot)
 }
 
@@ -92,43 +128,32 @@ func (store *Store) CommitSubscriptionRefresh(subscriptionID string, endpoints [
 		return false, errInvalidState
 	}
 
-	store.mu.Lock()
-	defer store.mu.Unlock()
-	lock, err := store.acquireFileLock()
-	if err != nil {
-		return false, err
-	}
-	defer lock.Close()
-	snapshot, err := store.loadLocked()
-	if err != nil {
-		return false, err
-	}
-	if !hasSubscription(snapshot.Subscriptions, subscriptionID) {
-		return false, errInvalidState
-	}
-
-	replaced := make([]domain.Endpoint, 0, len(snapshot.Endpoints)+len(endpoints))
-	for _, endpoint := range snapshot.Endpoints {
-		if endpoint.SubscriptionID != subscriptionID {
-			replaced = append(replaced, endpoint)
+	committed := false
+	err := store.Update(func(snapshot *Snapshot) error {
+		if !hasSubscription(snapshot.Subscriptions, subscriptionID) {
+			return errInvalidState
 		}
-	}
-	replaced = append(replaced, endpoints...)
-	snapshot.Endpoints = replaced
-	if err := validateSnapshot(snapshot); err != nil {
-		return false, errInvalidState
-	}
-	if err := store.writeLocked(snapshot); err != nil {
+		replaced := make([]domain.Endpoint, 0, len(snapshot.Endpoints)+len(endpoints))
+		for _, endpoint := range snapshot.Endpoints {
+			if endpoint.SubscriptionID != subscriptionID {
+				replaced = append(replaced, endpoint)
+			}
+		}
+		snapshot.Endpoints = append(replaced, endpoints...)
+		committed = true
+		return nil
+	})
+	if err != nil {
 		return false, err
 	}
-	return true, nil
+	return committed, nil
 }
 
 func (store *Store) acquireFileLock() (*filelock.Lock, error) {
-	if err := ensurePrivateStateDirectory(store.directory); err != nil {
+	if err := securepath.ValidatePrivateRoot(store.root); err != nil {
 		return nil, errStateStore
 	}
-	lock, err := filelock.Acquire(store.lockPath)
+	lock, err := filelock.Acquire(context.Background(), store.root, StateLockFileName)
 	if err != nil {
 		return nil, errStateStore
 	}
@@ -136,10 +161,10 @@ func (store *Store) acquireFileLock() (*filelock.Lock, error) {
 }
 
 func (store *Store) loadLocked() (Snapshot, error) {
-	if err := ensurePrivateStateDirectory(store.directory); err != nil {
+	if err := securepath.ValidatePrivateRoot(store.root); err != nil {
 		return Snapshot{}, errStateStore
 	}
-	info, err := os.Lstat(store.path)
+	info, err := store.root.Lstat(StateFileName)
 	if errors.Is(err, os.ErrNotExist) {
 		return Snapshot{SchemaVersion: CurrentSchemaVersion}, nil
 	}
@@ -147,7 +172,7 @@ func (store *Store) loadLocked() (Snapshot, error) {
 		return Snapshot{}, errInvalidState
 	}
 
-	file, err := os.Open(store.path)
+	file, err := store.root.OpenFile(StateFileName, os.O_RDONLY|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return Snapshot{}, errStateStore
 	}
@@ -173,10 +198,10 @@ func (store *Store) loadLocked() (Snapshot, error) {
 }
 
 func (store *Store) writeLocked(snapshot Snapshot) error {
-	if err := ensurePrivateStateDirectory(store.directory); err != nil {
+	if err := securepath.ValidatePrivateRoot(store.root); err != nil {
 		return errStateStore
 	}
-	if err := validatePrivateStateFileIfPresent(store.path); err != nil {
+	if err := validatePrivateStateFileIfPresent(store.root); err != nil {
 		return errStateStore
 	}
 	encoded, err := json.MarshalIndent(snapshot, "", "  ")
@@ -188,17 +213,11 @@ func (store *Store) writeLocked(snapshot Snapshot) error {
 		return errInvalidState
 	}
 
-	temporary, err := os.CreateTemp(store.directory, "."+StateFileName+"-")
+	temporary, temporaryName, err := securepath.CreatePrivateTemp(store.root, "."+StateFileName+"-")
 	if err != nil {
 		return errStateStore
 	}
-	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
-
-	if err := temporary.Chmod(0o600); err != nil {
-		_ = temporary.Close()
-		return errStateStore
-	}
+	defer store.root.Remove(temporaryName)
 	if _, err := temporary.Write(encoded); err != nil {
 		_ = temporary.Close()
 		return errStateStore
@@ -207,15 +226,32 @@ func (store *Store) writeLocked(snapshot Snapshot) error {
 		_ = temporary.Close()
 		return errStateStore
 	}
+	temporaryInfo, err := temporary.Stat()
+	if err != nil || !validPrivateStateFileInfo(temporaryInfo) || temporaryInfo.Size() != int64(len(encoded)) {
+		_ = temporary.Close()
+		return errStateStore
+	}
 	if err := temporary.Close(); err != nil {
 		return errStateStore
 	}
-	if err := os.Rename(temporaryPath, store.path); err != nil {
+	if err := store.root.Rename(temporaryName, StateFileName); err != nil {
 		return errStateStore
 	}
-	if err := syncStateDirectory(store.directory); err != nil {
+	finalInfo, err := store.root.Lstat(StateFileName)
+	if err != nil || !os.SameFile(temporaryInfo, finalInfo) || !validPrivateStateFileInfo(finalInfo) || finalInfo.Size() != int64(len(encoded)) {
 		return errStateStore
 	}
+	if err := securepath.SyncRoot(store.root); err != nil {
+		return errStateStore
+	}
+	return nil
+}
+
+func incrementRevision(snapshot *Snapshot) error {
+	if snapshot.Revision == math.MaxUint64 {
+		return errInvalidState
+	}
+	snapshot.Revision++
 	return nil
 }
 
@@ -311,15 +347,8 @@ func validStateString(value string, maxBytes int, required bool) bool {
 	return true
 }
 
-func ensurePrivateStateDirectory(directory string) error {
-	if err := securepath.EnsurePrivateDirectory(directory); err != nil {
-		return errStateStore
-	}
-	return nil
-}
-
-func validatePrivateStateFileIfPresent(path string) error {
-	info, err := os.Lstat(path)
+func validatePrivateStateFileIfPresent(root *os.Root) error {
+	info, err := root.Lstat(StateFileName)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
@@ -330,7 +359,7 @@ func validatePrivateStateFileIfPresent(path string) error {
 }
 
 func validPrivateStateFileInfo(info os.FileInfo) bool {
-	return info.Mode().IsRegular() && info.Mode().Perm()&0o077 == 0
+	return info.Mode().IsRegular() && info.Mode().Perm() == 0o600
 }
 
 func requireStateJSONEOF(decoder *json.Decoder) error {
@@ -339,13 +368,4 @@ func requireStateJSONEOF(decoder *json.Decoder) error {
 		return errInvalidState
 	}
 	return nil
-}
-
-func syncStateDirectory(directory string) error {
-	file, err := os.Open(directory)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-	return file.Sync()
 }

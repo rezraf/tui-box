@@ -13,7 +13,7 @@ func TestMacOSKeychainInvokesSecurityWithSafeArguments(t *testing.T) {
 	t.Parallel()
 
 	const secret = "https://user:password@example.com/private?token=query-secret"
-	runner := &recordingRunner{output: []byte(secret + "\n")}
+	runner := &recordingRunner{result: CommandResult{Stdout: []byte(secret + "\n")}}
 	store := newMacOSKeychainStore(runner)
 
 	if err := store.Set(context.Background(), "subscription-1", secret); err != nil {
@@ -80,7 +80,7 @@ func TestLinuxSecretServiceInvokesSecretToolWithSafeArguments(t *testing.T) {
 	t.Parallel()
 
 	const secret = "https://user:password@example.com/private?token=query-secret"
-	runner := &recordingRunner{output: []byte(secret + "\n")}
+	runner := &recordingRunner{result: CommandResult{Stdout: []byte(secret + "\n")}}
 	store := newLinuxSecretServiceStore("/usr/bin/secret-tool", runner)
 
 	if err := store.Set(context.Background(), "subscription-1", secret); err != nil {
@@ -115,20 +115,91 @@ func TestLinuxSecretServiceInvokesSecretToolWithSafeArguments(t *testing.T) {
 	assertRecordedCommands(t, runner.commands(), want, secret)
 }
 
+func TestCommandStoreNormalizesMissingSecretsAcrossBackends(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		store  func(CommandRunner) Store
+		result CommandResult
+	}{
+		{
+			name:  "macOS",
+			store: func(runner CommandRunner) Store { return newMacOSKeychainStore(runner) },
+			result: CommandResult{
+				ExitCode: 44,
+				Stderr:   []byte("security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain."),
+			},
+		},
+		{
+			name:   "Linux",
+			store:  func(runner CommandRunner) Store { return newLinuxSecretServiceStore("/usr/bin/secret-tool", runner) },
+			result: CommandResult{ExitCode: 1},
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			runner := &recordingRunner{result: test.result, err: errors.New("native command failed")}
+			store := test.store(runner)
+			if _, err := store.Get(context.Background(), "subscription-1"); !errors.Is(err, ErrSecretNotFound) {
+				t.Fatalf("Get() error = %v, want ErrSecretNotFound", err)
+			}
+			if err := store.Delete(context.Background(), "subscription-1"); err != nil {
+				t.Fatalf("Delete() missing secret returned an unexpected error: %v", err)
+			}
+		})
+	}
+}
+
 func TestCommandStoreRedactsRunnerErrors(t *testing.T) {
 	t.Parallel()
 
 	const secret = "https://user:password@example.com/private?token=query-secret"
-	runner := &recordingRunner{err: errors.New("failed with " + secret)}
-	store := newLinuxSecretServiceStore("/usr/bin/secret-tool", runner)
-
-	err := store.Set(context.Background(), "subscription-1", secret)
-	if err == nil {
-		t.Fatal("Set() returned nil error, want runner failure")
+	for _, operation := range []struct {
+		name string
+		run  func(Store) error
+	}{
+		{name: "Get", run: func(store Store) error { _, err := store.Get(context.Background(), "subscription-1"); return err }},
+		{name: "Set", run: func(store Store) error { return store.Set(context.Background(), "subscription-1", secret) }},
+		{name: "Delete", run: func(store Store) error { return store.Delete(context.Background(), "subscription-1") }},
+	} {
+		operation := operation
+		t.Run(operation.name, func(t *testing.T) {
+			t.Parallel()
+			runner := &recordingRunner{
+				result: CommandResult{ExitCode: 2, Stderr: []byte("failed with " + secret)},
+				err:    errors.New("failed with " + secret),
+			}
+			err := operation.run(newLinuxSecretServiceStore("/usr/bin/secret-tool", runner))
+			if err == nil {
+				t.Fatalf("%s() returned nil error, want runner failure", operation.name)
+			}
+			for _, sensitive := range []string{secret, "password", "example.com", "query-secret"} {
+				if strings.Contains(err.Error(), sensitive) {
+					t.Fatalf("command error leaked %q: %v", sensitive, err)
+				}
+			}
+		})
 	}
-	for _, sensitive := range []string{secret, "password", "example.com", "query-secret"} {
-		if strings.Contains(err.Error(), sensitive) {
-			t.Fatalf("command error leaked %q: %v", sensitive, err)
+}
+
+func TestCommandStorePreservesContextErrorIdentity(t *testing.T) {
+	t.Parallel()
+
+	for _, contextErr := range []error{context.Canceled, context.DeadlineExceeded} {
+		runner := &recordingRunner{result: CommandResult{ExitCode: 1}, err: contextErr}
+		store := newLinuxSecretServiceStore("/usr/bin/secret-tool", runner)
+		if _, err := store.Get(context.Background(), "subscription-1"); !errors.Is(err, contextErr) {
+			t.Fatalf("Get() error = %v, want %v identity", err, contextErr)
+		}
+		if err := store.Set(context.Background(), "subscription-1", "secret"); !errors.Is(err, contextErr) {
+			t.Fatalf("Set() error = %v, want %v identity", err, contextErr)
+		}
+		if err := store.Delete(context.Background(), "subscription-1"); !errors.Is(err, contextErr) {
+			t.Fatalf("Delete() error = %v, want %v identity", err, contextErr)
 		}
 	}
 }
@@ -155,11 +226,11 @@ type recordedCommand struct {
 type recordingRunner struct {
 	mu       sync.Mutex
 	recorded []recordedCommand
-	output   []byte
+	result   CommandResult
 	err      error
 }
 
-func (runner *recordingRunner) Run(_ context.Context, executable string, arguments []string, stdin string) ([]byte, error) {
+func (runner *recordingRunner) Run(_ context.Context, executable string, arguments []string, stdin string) (CommandResult, error) {
 	runner.mu.Lock()
 	defer runner.mu.Unlock()
 	runner.recorded = append(runner.recorded, recordedCommand{
@@ -167,7 +238,10 @@ func (runner *recordingRunner) Run(_ context.Context, executable string, argumen
 		arguments:  append([]string(nil), arguments...),
 		stdin:      stdin,
 	})
-	return append([]byte(nil), runner.output...), runner.err
+	result := runner.result
+	result.Stdout = append([]byte(nil), result.Stdout...)
+	result.Stderr = append([]byte(nil), result.Stderr...)
+	return result, runner.err
 }
 
 func (runner *recordingRunner) commands() []recordedCommand {
