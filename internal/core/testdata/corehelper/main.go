@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 )
 
 const outputBytes = 128 * 1024
@@ -24,7 +25,7 @@ func main() {
 	switch os.Args[1] {
 	case "check":
 		if bytes.Contains(config, []byte("block-check.example.com")) {
-			select {}
+			time.Sleep(24 * time.Hour)
 		}
 		if bytes.Contains(config, []byte("fail-check.example.com")) {
 			_, _ = os.Stderr.Write(config)
