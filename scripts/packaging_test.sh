@@ -2,9 +2,11 @@
 set -eu
 
 repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-work_dir=$(mktemp -d)
-root_scope_dir=$(mktemp -d "$repo_dir/.packaging-root.XXXXXX")
-trap 'rm -rf "$work_dir" "$root_scope_dir"' EXIT HUP INT TERM
+test_base=$(mktemp -d "$HOME/.tuibox-packaging.XXXXXX")
+work_dir=$test_base/work
+root_scope_dir=$test_base/root
+mkdir -m 700 "$work_dir" "$root_scope_dir"
+trap 'rm -rf "$test_base"' EXIT HUP INT TERM
 
 grep -F -- '--max-filesize "$maximum_bytes"' "$repo_dir/install.sh" >/dev/null || {
   printf 'installer downloads are not size bounded\n' >&2
