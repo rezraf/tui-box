@@ -386,6 +386,9 @@ func TestRunnerRejectsChangedExecutable(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeExecutable(t, directory, "sing-box", 0o700)
+	if err := os.WriteFile(executable, []byte("changed executable"), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	if err := runner.Check(context.Background(), prepared); !errors.Is(err, ErrInvalidExecutable) {
 		t.Fatalf("Check() after executable replacement error = %v, want ErrInvalidExecutable", err)
 	}

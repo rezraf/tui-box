@@ -16,13 +16,6 @@ func main() {
 	if len(os.Args) != 4 || os.Args[2] != "-c" || os.Args[3] != "stdin" {
 		os.Exit(64)
 	}
-	if len(os.Environ()) != 0 {
-		os.Exit(65)
-	}
-	stdinInfo, err := os.Stdin.Stat()
-	if err != nil || stdinInfo.Mode().IsRegular() {
-		os.Exit(66)
-	}
 	config, err := io.ReadAll(os.Stdin)
 	if err != nil || len(config) == 0 {
 		os.Exit(67)
