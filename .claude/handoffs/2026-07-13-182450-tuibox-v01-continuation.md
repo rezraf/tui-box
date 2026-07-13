@@ -1,10 +1,11 @@
 # Handoff: Continue TuiBox v0.1 Implementation
 
+Historical implementation record. The current verified state is maintained in [`HANDOFF.md`](../../HANDOFF.md); all working paths below are repository-relative.
+
 ## Session Metadata
 
 - Created: 2026-07-13 18:24:50
-- Primary repository: `/Users/rezraf/tui-box`
-- Active implementation worktree: `/Users/rezraf/.config/superpowers/worktrees/tui-box/feature-v0.1`
+- Repository: the checkout root reported by `git rev-parse --show-toplevel`
 - Branch: `feature/v0.1`
 - Base branch: `main` at `53aa4d4`
 - Current committed HEAD before this handoff commit: `84e80bb`
@@ -161,10 +162,9 @@ Do not mark Task 6 complete until all remaining Task 6 packages and full verific
 
 ## Immediate Next Steps
 
-1. Enter the active worktree and inspect the partial Task 6 diff:
+1. From the repository root, inspect the partial Task 6 diff:
 
    ```bash
-   cd /Users/rezraf/.config/superpowers/worktrees/tui-box/feature-v0.1
    git status --short --branch
    git diff
    go test ./internal/latency ./internal/redact ./internal/state
@@ -219,7 +219,7 @@ Do not mark Task 6 complete until all remaining Task 6 packages and full verific
 
 ## Important Context
 
-- Work in `/Users/rezraf/.config/superpowers/worktrees/tui-box/feature-v0.1`, not `/Users/rezraf/tui-box`. The primary checkout only contains the initial design commit.
+- Work on branch `feature/v0.1` in the current repository checkout; confirm it with `git status --short --branch` before changing files.
 - The feature branch is 26+ commits ahead of `main`. Do not reset or recreate completed Tasks 1–5.
 - Task 6 has committed partial code in `84e80bb`. Preserve it or deliberately rewrite it; it has tests but has not yet passed separate spec/quality review.
 - Tasks 1–5 have already passed repeated spec and quality reviews. Changes to their security boundaries require regression tests and another review.
@@ -279,7 +279,7 @@ Do not mark Task 6 complete until all remaining Task 6 packages and full verific
 Run before accepting partial work:
 
 ```bash
-cd /Users/rezraf/.config/superpowers/worktrees/tui-box/feature-v0.1
+cd "$(git rev-parse --show-toplevel)"
 go test ./...
 go test -race ./...
 go vet ./...

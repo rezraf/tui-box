@@ -1,8 +1,10 @@
 package state
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -34,6 +36,60 @@ func TestSnapshotSettingsDefaultTelemetryToDisabledAndPersistConsent(t *testing.
 	}
 	if !persisted.Settings.TelemetryEnabled {
 		t.Fatal("telemetry consent was not persisted")
+	}
+}
+
+func TestStoreRoundTripsLegacyStateWithoutSettings(t *testing.T) {
+	t.Parallel()
+
+	fixture, err := os.ReadFile(filepath.Join("testdata", "legacy-v1-without-settings.json"))
+	if err != nil {
+		t.Fatalf("ReadFile() fixture error = %v", err)
+	}
+	directory := filepath.Join(t.TempDir(), "state")
+	store, err := NewStore(directory)
+	if err != nil {
+		t.Fatalf("NewStore() error = %v", err)
+	}
+	defer store.Close()
+	statePath := filepath.Join(directory, StateFileName)
+	if err := os.WriteFile(statePath, fixture, 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	legacy, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load() legacy fixture error = %v", err)
+	}
+	if legacy.Settings.TelemetryEnabled {
+		t.Fatal("legacy state enabled telemetry")
+	}
+	if legacy.Revision != 7 || len(legacy.Subscriptions) != 1 || len(legacy.Endpoints) != 1 {
+		t.Fatalf("legacy data = %#v, want revision 7 with one subscription and endpoint", legacy)
+	}
+
+	want := legacy
+	want.Revision++
+	if err := store.Save(legacy); err != nil {
+		t.Fatalf("Save() legacy snapshot error = %v", err)
+	}
+	roundTripped, err := store.Load()
+	if err != nil {
+		t.Fatalf("Load() round trip error = %v", err)
+	}
+	if !reflect.DeepEqual(roundTripped, want) {
+		t.Fatalf("round trip = %#v, want %#v", roundTripped, want)
+	}
+	content, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("ReadFile() round trip error = %v", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(content, &fields); err != nil {
+		t.Fatalf("Unmarshal() round trip error = %v", err)
+	}
+	if _, exists := fields["settings"]; !exists {
+		t.Fatal("round trip did not persist explicit disabled settings")
 	}
 }
 

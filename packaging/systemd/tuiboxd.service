@@ -1,0 +1,21 @@
+[Unit]
+Description=TuiBox privileged connection daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=@TUIBOX_DAEMON@ --core @TUIBOX_CORE@ --runtime-dir @TUIBOX_STATE_DIR@ --socket @TUIBOX_SOCKET@ --socket-gid @TUIBOX_GID@ --allow-uid @TUIBOX_UID@
+Restart=on-failure
+RestartSec=2s
+User=root
+Group=root
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=@TUIBOX_STATE_DIR@ @TUIBOX_RUN_DIR@
+
+[Install]
+WantedBy=multi-user.target

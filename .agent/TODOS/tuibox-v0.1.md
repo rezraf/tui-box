@@ -10,15 +10,15 @@
   - Verify: `go test ./internal/core`
 - [x] Add peer-authenticated Unix RPC and daemon lifecycle
   - Verify: `go test ./internal/rpc ./internal/daemon`
-- [ ] Add refresh, latency, redaction, telemetry consent, and CLI services
+- [x] Add refresh, latency, redaction, telemetry consent, and CLI services
   - Verify: `go test ./internal/app ./internal/latency ./internal/redact ./internal/telemetry ./internal/cli`
-- [ ] Add functional Bubble Tea server selector
+- [x] Add functional Bubble Tea server selector
   - Verify: `go test ./internal/tui`
-- [ ] Add installer, updater, system services, and release workflows
+- [x] Add installer, updater, system services, and release workflows
   - Verify: `sh -n install.sh uninstall.sh && go test ./internal/update`
-- [ ] Add English OSS documentation and governance files
-  - Verify: `go run ./cmd/tuibox --help && git grep -n 'TODO\|CHANGEME\|YOUR_' -- ':!go.sum'` returns no unintended placeholders
-- [ ] Complete adversarial security review and full verification
-  - Verify: `go test -race ./... && go vet ./... && go build ./cmd/tuibox ./cmd/tuiboxd && ./scripts/cross-build.sh && git diff --check`
+- [x] Add English OSS documentation and governance files
+  - Verify: `go run ./cmd/tuibox --help`, all subcommand help paths, `go test ./scripts -run 'TestDocumentation'`, and the placeholder/secret scans pass
+- [x] Complete adversarial security review and full verification
+  - Verify: release-source and documentation validators, `go test -race ./...`, `go vet ./...`, `go build ./cmd/tuibox ./cmd/tuiboxd`, `./scripts/cross-build.sh`, and `git diff --check`
 - [ ] Remove local caches created by TuiBox development and verification
   - Verify: TuiBox core-test cache and temporary build/release artifacts no longer exist; unrelated caches remain untouched

@@ -755,6 +755,27 @@ func TestEndpointValidateRejectsControlCharacters(t *testing.T) {
 	}
 }
 
+func TestEndpointValidateRejectsTerminalUnsafeUnicodeAndPreservesRTLText(t *testing.T) {
+	t.Parallel()
+
+	for _, character := range []rune{
+		rune(0x200e), rune(0x200f), rune(0x202a), rune(0x202b), rune(0x202c), rune(0x202d), rune(0x202e),
+		rune(0x2066), rune(0x2067), rune(0x2068), rune(0x2069), rune(0x2028), rune(0x2029), rune(0x200b), rune(0xfeff),
+	} {
+		endpoint := validEndpoint()
+		endpoint.Name = "Safe" + string(character) + "txt"
+		if err := endpoint.Validate(); err == nil {
+			t.Fatalf("Validate() accepted terminal-unsafe rune U+%04X", character)
+		}
+	}
+
+	endpoint := validEndpoint()
+	endpoint.Name = "خادم آمن"
+	if err := endpoint.Validate(); err != nil {
+		t.Fatalf("Validate() rejected ordinary RTL letters: %v", err)
+	}
+}
+
 func TestEndpointValidateRejectsOversizedFields(t *testing.T) {
 	t.Parallel()
 

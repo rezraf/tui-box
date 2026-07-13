@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"regexp"
 	"strings"
@@ -617,6 +618,160 @@ func TestParseShadowsocksSIP002Variants(t *testing.T) {
 	}
 }
 
+func TestParseCanonicalizesEquivalentIPLiteralHostsAcrossFormats(t *testing.T) {
+	t.Parallel()
+
+	addressSets := []struct {
+		name  string
+		hosts []string
+		want  string
+	}{
+		{
+			name: "IPv6 compressed expanded zero-padded and uppercase",
+			hosts: []string{
+				"2001:db8::1",
+				"2001:0DB8:0000:0000:0000:0000:0000:0001",
+				"2001:DB8:0:0:0:0:0:1",
+			},
+			want: "2001:db8::1",
+		},
+		{
+			name:  "IPv4 mapped IPv6",
+			hosts: []string{"192.0.2.1", "::FFFF:192.0.2.1"},
+			want:  "192.0.2.1",
+		},
+	}
+
+	for _, addressSet := range addressSets {
+		addressSet := addressSet
+		t.Run(addressSet.name, func(t *testing.T) {
+			t.Parallel()
+			for _, document := range ipLiteralDocuments(addressSet.hosts) {
+				document := document
+				t.Run(document.name, func(t *testing.T) {
+					t.Parallel()
+					result, err := Parse(testSubscriptionID, document.body)
+					if err != nil {
+						t.Fatalf("Parse() returned an unexpected error: %v", err)
+					}
+					if len(result.Endpoints) != 1 {
+						t.Fatalf("len(Endpoints) = %d, want equivalent hosts deduplicated", len(result.Endpoints))
+					}
+					if got := result.Endpoints[0].Host; got != addressSet.want {
+						t.Fatalf("Host = %q, want canonical %q", got, addressSet.want)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestParseKeepsDistinctIPLiteralHostsAcrossFormats(t *testing.T) {
+	t.Parallel()
+
+	for _, document := range ipLiteralDocuments([]string{"2001:db8::1", "2001:db8::2"}) {
+		document := document
+		t.Run(document.name, func(t *testing.T) {
+			t.Parallel()
+			result, err := Parse(testSubscriptionID, document.body)
+			if err != nil {
+				t.Fatalf("Parse() returned an unexpected error: %v", err)
+			}
+			if len(result.Endpoints) != 2 {
+				t.Fatalf("len(Endpoints) = %d, want distinct addresses preserved", len(result.Endpoints))
+			}
+		})
+	}
+}
+
+func TestParseRejectsZonedIPLiteralHostsAcrossFormats(t *testing.T) {
+	t.Parallel()
+
+	for _, document := range ipLiteralDocuments([]string{"fe80::1%eth0"}) {
+		document := document
+		t.Run(document.name, func(t *testing.T) {
+			t.Parallel()
+			result, err := Parse(testSubscriptionID, document.body)
+			if err == nil {
+				t.Fatal("Parse() returned nil error, want zoned IP rejection")
+			}
+			if len(result.Endpoints) != 0 {
+				t.Fatalf("len(Endpoints) = %d, want none", len(result.Endpoints))
+			}
+		})
+	}
+}
+
+func TestEndpointFingerprintCanonicalizesIPLiteralIdentityHosts(t *testing.T) {
+	t.Parallel()
+
+	first := domain.Endpoint{
+		Protocol: domain.ProtocolVLESS,
+		Host:     "2001:0DB8:0000:0000:0000:0000:0000:0001",
+		Port:     443,
+		UUID:     "550e8400-e29b-41d4-a716-446655440000",
+		TLS: domain.TLSOptions{
+			Enabled:    true,
+			ServerName: "2001:0DB8:0000:0000:0000:0000:0000:0002",
+		},
+		Transport: domain.TransportOptions{
+			Type: domain.TransportWebSocket,
+			Host: "2001:0DB8:0000:0000:0000:0000:0000:0003",
+		},
+	}
+	second := first
+	second.Host = "2001:db8::1"
+	second.TLS.ServerName = "2001:db8::2"
+	second.Transport.Host = "2001:db8::3"
+
+	firstFingerprint, err := EndpointFingerprint(first)
+	if err != nil {
+		t.Fatalf("EndpointFingerprint(first) error = %v", err)
+	}
+	secondFingerprint, err := EndpointFingerprint(second)
+	if err != nil {
+		t.Fatalf("EndpointFingerprint(second) error = %v", err)
+	}
+	if firstFingerprint != secondFingerprint {
+		t.Fatalf("equivalent IP identity fingerprints differ: %q != %q", firstFingerprint, secondFingerprint)
+	}
+
+	for _, host := range []string{"fe80::1%eth0", "fe80::1%", "192.0.2.1%eth0"} {
+		zoned := first
+		zoned.Host = host
+		if _, err := EndpointFingerprint(zoned); err == nil {
+			t.Fatalf("EndpointFingerprint() accepted zoned IP literal %q", host)
+		}
+	}
+}
+
+type ipLiteralDocument struct {
+	name string
+	body []byte
+}
+
+func ipLiteralDocuments(hosts []string) []ipLiteralDocument {
+	uriEntries := make([]string, 0, len(hosts))
+	clashEntries := make([]string, 0, len(hosts))
+	singBoxEntries := make([]string, 0, len(hosts))
+	for index, host := range hosts {
+		uriHost := host
+		if strings.ContainsRune(host, ':') {
+			uriHost = "[" + strings.ReplaceAll(host, "%", "%25") + "]"
+		}
+		uriEntries = append(uriEntries, fmt.Sprintf("ss://aes-256-gcm:secret@%s:8388#Endpoint%%20%d", uriHost, index))
+		clashEntries = append(clashEntries, fmt.Sprintf("  - name: Endpoint %d\n    type: ss\n    server: %q\n    port: 8388\n    cipher: aes-256-gcm\n    password: secret\n", index, host))
+		singBoxEntries = append(singBoxEntries, fmt.Sprintf(`{"type":"shadowsocks","tag":"Endpoint %d","server":%q,"server_port":8388,"method":"aes-256-gcm","password":"secret"}`, index, host))
+	}
+	uriDocument := []byte(strings.Join(uriEntries, "\n"))
+	return []ipLiteralDocument{
+		{name: "URI", body: uriDocument},
+		{name: "Base64", body: []byte(base64.StdEncoding.EncodeToString(uriDocument))},
+		{name: "Clash", body: []byte("proxies:\n" + strings.Join(clashEntries, ""))},
+		{name: "sing-box", body: []byte(`{"outbounds":[` + strings.Join(singBoxEntries, ",") + `]}`)},
+	}
+}
+
 func TestParseRealityCredentialsAffectNormalizedEndpointID(t *testing.T) {
 	t.Parallel()
 
@@ -846,6 +1001,30 @@ func TestParseVMessRejectsInvalidUTF8BeforeJSONDecode(t *testing.T) {
 	payload := base64.StdEncoding.EncodeToString(decoded)
 	if _, err := parseVMess("vmess://" + payload); err == nil {
 		t.Fatal("parseVMess() returned nil error, want invalid UTF-8 rejection")
+	}
+}
+
+func TestStructuredAndURIParsersRejectTerminalUnsafeNamesButAcceptRTLLetters(t *testing.T) {
+	unsafeName := "Safe" + string(rune(0x202e)) + "txt"
+	credential := base64.RawURLEncoding.EncodeToString([]byte("aes-256-gcm:secret"))
+	unsafeDocuments := map[string][]byte{
+		"URI":      []byte("ss://" + credential + "@proxy.example.com:443#" + url.PathEscape(unsafeName)),
+		"Clash":    []byte("proxies:\n  - name: \"" + unsafeName + "\"\n    type: ss\n    server: proxy.example.com\n    port: 443\n    cipher: aes-256-gcm\n    password: secret\n"),
+		"sing-box": []byte(`{"outbounds":[{"type":"shadowsocks","tag":"` + unsafeName + `","server":"proxy.example.com","server_port":443,"method":"aes-256-gcm","password":"secret"}]}`),
+	}
+	for name, document := range unsafeDocuments {
+		t.Run(name+" unsafe", func(t *testing.T) {
+			if result, err := Parse(testSubscriptionID, document); err == nil || len(result.Endpoints) != 0 {
+				t.Fatalf("Parse() = %#v, %v; want terminal-unsafe name rejection", result, err)
+			}
+		})
+	}
+
+	rtlName := "خادم آمن"
+	rtlDocument := []byte("ss://" + credential + "@proxy.example.com:443#" + url.PathEscape(rtlName))
+	result, err := Parse(testSubscriptionID, rtlDocument)
+	if err != nil || len(result.Endpoints) != 1 || result.Endpoints[0].Name != rtlName {
+		t.Fatalf("ordinary RTL name parse = %#v, %v", result, err)
 	}
 }
 

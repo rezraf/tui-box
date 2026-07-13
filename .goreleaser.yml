@@ -1,0 +1,65 @@
+version: 2
+
+project_name: tuibox
+
+builds:
+  - id: tuibox
+    main: ./cmd/tuibox
+    binary: tuibox
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X main.version={{ .Tag }}
+      - -X main.build={{ .ShortCommit }}
+
+  - id: tuiboxd
+    main: ./cmd/tuiboxd
+    binary: tuiboxd
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+
+archives:
+  - id: tuibox
+    ids:
+      - tuibox
+      - tuiboxd
+    name_template: "tuibox_{{ .Os }}_{{ .Arch }}"
+    formats:
+      - tar.gz
+    files:
+      - LICENSE
+      - THIRD_PARTY_NOTICES
+      - README.md
+      - install.sh
+      - uninstall.sh
+      - scripts/stable-release.sh
+      - packaging/systemd/tuiboxd.service
+      - packaging/launchd/io.github.rezraf.tuiboxd.plist
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+changelog:
+  use: github-native
+
+release:
+  draft: true
+  replace_existing_draft: true
+  prerelease: auto
+  make_latest: false

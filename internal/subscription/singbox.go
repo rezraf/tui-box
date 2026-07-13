@@ -1,15 +1,12 @@
 package subscription
 
 import (
+	"bytes"
 	"encoding/json"
 	"strings"
 
 	"github.com/rezraf/tui-box/internal/domain"
 )
-
-type singBoxDocument struct {
-	Outbounds []json.RawMessage `json:"outbounds"`
-}
 
 type singBoxOutbound struct {
 	Type              string            `json:"type"`
@@ -71,26 +68,21 @@ type singBoxObfs struct {
 }
 
 func parseSingBox(subscriptionID string, content []byte) (ParseResult, error) {
-	if err := validateStrictJSON(content); err != nil {
-		return ParseResult{}, errMalformedDocument
-	}
-	var document singBoxDocument
-	if err := json.Unmarshal(content, &document); err != nil {
-		return ParseResult{}, errMalformedDocument
-	}
-	if len(document.Outbounds) > MaxEntries {
-		return ParseResult{}, errTooManyEntries
+	entries, err := scanSingBoxEntries(content)
+	if err != nil {
+		return ParseResult{}, err
 	}
 	result := ParseResult{Format: domain.SubscriptionFormatSingBox}
 	seen := make(map[string]struct{})
-	for index, raw := range document.Outbounds {
+	for index, entry := range entries {
 		entryNumber := index + 1
-		if len(raw) > MaxEntryBytes {
+		if entry.oversized {
 			result.Warnings = append(result.Warnings, oversizedWarning(subscriptionID, entryNumber))
 			continue
 		}
 		var outbound singBoxOutbound
-		if err := json.Unmarshal(raw, &outbound); err != nil {
+		decoder := json.NewDecoder(bytes.NewReader(content[entry.start:entry.end]))
+		if err := decoder.Decode(&outbound); err != nil {
 			result.Warnings = append(result.Warnings, invalidWarning(subscriptionID, entryNumber))
 			continue
 		}

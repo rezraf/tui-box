@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>io.github.rezraf.tuiboxd</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@TUIBOX_DAEMON@</string>
+    <string>--core</string>
+    <string>@TUIBOX_CORE@</string>
+    <string>--runtime-dir</string>
+    <string>@TUIBOX_STATE_DIR@</string>
+    <string>--socket</string>
+    <string>@TUIBOX_SOCKET@</string>
+    <string>--socket-gid</string>
+    <string>@TUIBOX_GID@</string>
+    <string>--allow-uid</string>
+    <string>@TUIBOX_UID@</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+  <key>StandardOutPath</key>
+  <string>/var/log/tuiboxd.log</string>
+  <key>StandardErrorPath</key>
+  <string>/var/log/tuiboxd.log</string>
+</dict>
+</plist>

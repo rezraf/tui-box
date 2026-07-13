@@ -10,5 +10,5 @@ do
   goos=${target%/*}
   goarch=${target#*/}
   printf 'cross-build: %s/%s (CGO_ENABLED=0)\n' "$goos" "$goarch"
-  CGO_ENABLED=0 GOOS=$goos GOARCH=$goarch go build ./...
+  CGO_ENABLED=0 GOOS=$goos GOARCH=$goarch go build ./cmd/tuibox ./cmd/tuiboxd
 done

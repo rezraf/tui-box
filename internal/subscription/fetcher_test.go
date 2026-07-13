@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -98,6 +100,134 @@ func TestFetcherRejectsUnsupportedRedirectScheme(t *testing.T) {
 		t.Fatal("Fetch() returned nil error, want unsupported redirect rejection")
 	}
 	assertFetchErrorRedacted(t, err, server.URL, "file", "private", "token", "secret")
+}
+
+func TestFetcherRejectsCrossOriginRedirectsToSpecialUseNetworksBeforeRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		targetHost string
+		addresses  []netip.Addr
+	}{
+		{name: "literal loopback IPv4", targetHost: "127.0.0.1"},
+		{name: "literal RFC1918", targetHost: "192.168.10.20"},
+		{name: "literal link local", targetHost: "169.254.10.20"},
+		{name: "literal unspecified", targetHost: "0.0.0.0"},
+		{name: "literal multicast", targetHost: "224.0.0.1"},
+		{name: "literal loopback IPv6", targetHost: "[::1]"},
+		{name: "literal ULA", targetHost: "[fd00::1]"},
+		{name: "literal link local IPv6", targetHost: "[fe80::1]"},
+		{name: "literal unspecified IPv6", targetHost: "[::]"},
+		{name: "literal multicast IPv6", targetHost: "[ff02::1]"},
+		{name: "DNS loopback", targetHost: "loopback.example", addresses: []netip.Addr{netip.MustParseAddr("127.0.0.1")}},
+		{name: "DNS RFC1918", targetHost: "private.example", addresses: []netip.Addr{netip.MustParseAddr("10.10.10.10")}},
+		{name: "DNS ULA", targetHost: "ula.example", addresses: []netip.Addr{netip.MustParseAddr("fd00::10")}},
+		{name: "DNS link local", targetHost: "link.example", addresses: []netip.Addr{netip.MustParseAddr("169.254.10.10")}},
+		{name: "DNS unspecified", targetHost: "unspecified.example", addresses: []netip.Addr{netip.MustParseAddr("::")}},
+		{name: "DNS multicast", targetHost: "multicast.example", addresses: []netip.Addr{netip.MustParseAddr("ff02::1")}},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			var requests atomic.Int32
+			transport := roundTripperFunc(func(request *http.Request) (*http.Response, error) {
+				requestNumber := requests.Add(1)
+				if requestNumber == 1 {
+					return redirectResponse(request, "https://"+test.targetHost+":8443/admin"), nil
+				}
+				return textResponse(request, "reached private target"), nil
+			})
+			resolver := &staticResolver{addresses: map[string][]netip.Addr{strings.Trim(test.targetHost, "[]"): test.addresses}}
+			fetcher := newFetcherWithResolver(&http.Client{Transport: transport}, resolver)
+			_, err := fetcher.Fetch(context.Background(), "https://provider.example/subscription")
+			if !errors.Is(err, errSubscriptionRedirectRejected) {
+				t.Fatalf("Fetch() error = %v, want redirect rejection", err)
+			}
+			if requests.Load() != 1 {
+				t.Fatalf("RoundTrip calls = %d, want 1", requests.Load())
+			}
+		})
+	}
+}
+
+func TestFetcherRedirectPolicyAllowsSameOriginAndPublicCrossOriginButRejectsLaterPrivateHop(t *testing.T) {
+	t.Parallel()
+
+	resolver := &staticResolver{addresses: map[string][]netip.Addr{
+		"public.example":  {netip.MustParseAddr("93.184.216.34")},
+		"private.example": {netip.MustParseAddr("10.0.0.8")},
+	}}
+	for _, test := range []struct {
+		name         string
+		firstTarget  string
+		secondTarget string
+		wantBody     string
+		wantErr      error
+		wantRequests int32
+	}{
+		{name: "same origin private provider", firstTarget: "/same-origin", wantBody: "ok", wantRequests: 2},
+		{name: "public cross origin", firstTarget: "https://public.example/subscription", wantBody: "ok", wantRequests: 2},
+		{name: "multi-hop private target", firstTarget: "https://public.example/next", secondTarget: "https://private.example/admin", wantErr: errSubscriptionRedirectRejected, wantRequests: 2},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			var requests atomic.Int32
+			transport := roundTripperFunc(func(request *http.Request) (*http.Response, error) {
+				switch requests.Add(1) {
+				case 1:
+					return redirectResponse(request, test.firstTarget), nil
+				case 2:
+					if test.secondTarget != "" {
+						return redirectResponse(request, test.secondTarget), nil
+					}
+					return textResponse(request, test.wantBody), nil
+				default:
+					return textResponse(request, "unexpected"), nil
+				}
+			})
+			fetcher := newFetcherWithResolver(&http.Client{Transport: transport}, resolver)
+			body, err := fetcher.Fetch(context.Background(), "https://provider.example/start")
+			if !errors.Is(err, test.wantErr) {
+				t.Fatalf("Fetch() error = %v, want %v", err, test.wantErr)
+			}
+			if string(body) != test.wantBody {
+				t.Fatalf("Fetch() body = %q, want %q", body, test.wantBody)
+			}
+			if requests.Load() != test.wantRequests {
+				t.Fatalf("RoundTrip calls = %d, want %d", requests.Load(), test.wantRequests)
+			}
+		})
+	}
+}
+
+func TestResolvedRedirectDialTargetPinsTheValidatedAddressAgainstDNSRebinding(t *testing.T) {
+	t.Parallel()
+
+	resolver := &rebindingResolver{
+		first:  []netip.Addr{netip.MustParseAddr("93.184.216.34")},
+		second: []netip.Addr{netip.MustParseAddr("127.0.0.1")},
+	}
+	target, err := resolveDialTarget(context.Background(), "rebind.example:443", true, resolver)
+	if err != nil {
+		t.Fatalf("resolveDialTarget: %v", err)
+	}
+	var dialed string
+	sentinel := errors.New("stop after recording dial")
+	_, err = target.dial(context.Background(), "tcp", func(_ context.Context, _, address string) (net.Conn, error) {
+		dialed = address
+		return nil, sentinel
+	})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("dial error = %v, want sentinel", err)
+	}
+	if dialed != "93.184.216.34:443" {
+		t.Fatalf("dialed address = %q, want pinned public address", dialed)
+	}
+	if resolver.calls.Load() != 1 {
+		t.Fatalf("DNS lookups = %d, want 1", resolver.calls.Load())
+	}
 }
 
 func TestFetcherBoundsRedirects(t *testing.T) {
@@ -302,6 +432,52 @@ type trackingBody struct {
 func (body *trackingBody) Close() error {
 	body.closed.Store(true)
 	return nil
+}
+
+type staticResolver struct {
+	addresses map[string][]netip.Addr
+}
+
+func (resolver *staticResolver) LookupNetIP(_ context.Context, network, host string) ([]netip.Addr, error) {
+	if network != "ip" {
+		return nil, errors.New("unexpected network")
+	}
+	addresses, ok := resolver.addresses[host]
+	if !ok {
+		return nil, errors.New("host not found")
+	}
+	return append([]netip.Addr(nil), addresses...), nil
+}
+
+type rebindingResolver struct {
+	first  []netip.Addr
+	second []netip.Addr
+	calls  atomic.Int32
+}
+
+func (resolver *rebindingResolver) LookupNetIP(context.Context, string, string) ([]netip.Addr, error) {
+	if resolver.calls.Add(1) == 1 {
+		return append([]netip.Addr(nil), resolver.first...), nil
+	}
+	return append([]netip.Addr(nil), resolver.second...), nil
+}
+
+func redirectResponse(request *http.Request, location string) *http.Response {
+	return &http.Response{
+		StatusCode: http.StatusFound,
+		Header:     http.Header{"Location": []string{location}},
+		Body:       io.NopCloser(strings.NewReader("")),
+		Request:    request,
+	}
+}
+
+func textResponse(request *http.Request, body string) *http.Response {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Request:    request,
+	}
 }
 
 func assertFetchErrorRedacted(t *testing.T, err error, sensitive ...string) {

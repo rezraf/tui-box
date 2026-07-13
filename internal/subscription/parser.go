@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/netip"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -104,7 +105,10 @@ func addEndpoint(result *ParseResult, endpoint domain.Endpoint, subscriptionID s
 	if endpoint.Name == "" {
 		endpoint.Name = defaultEndpointName(endpoint.Protocol)
 	}
-	normalizeEndpoint(&endpoint)
+	if err := normalizeEndpoint(&endpoint); err != nil {
+		result.Warnings = append(result.Warnings, invalidWarning(subscriptionID, entry))
+		return
+	}
 	id, err := endpointID(endpoint)
 	if err != nil {
 		result.Warnings = append(result.Warnings, invalidWarning(subscriptionID, entry))
@@ -122,15 +126,34 @@ func addEndpoint(result *ParseResult, endpoint domain.Endpoint, subscriptionID s
 	result.Endpoints = append(result.Endpoints, endpoint)
 }
 
-func normalizeEndpoint(endpoint *domain.Endpoint) {
-	endpoint.Host = normalizeHost(endpoint.Host)
+func normalizeEndpoint(endpoint *domain.Endpoint) error {
+	var err error
+	if endpoint.Host, err = normalizeHost(endpoint.Host); err != nil {
+		return err
+	}
 	endpoint.UUID = strings.ToLower(endpoint.UUID)
-	endpoint.TLS.ServerName = normalizeHost(endpoint.TLS.ServerName)
-	endpoint.Transport.Host = normalizeHost(endpoint.Transport.Host)
+	if endpoint.TLS.ServerName, err = normalizeHost(endpoint.TLS.ServerName); err != nil {
+		return err
+	}
+	if endpoint.Transport.Host, err = normalizeHost(endpoint.Transport.Host); err != nil {
+		return err
+	}
+	return nil
 }
 
-func normalizeHost(host string) string {
-	return strings.ToLower(strings.TrimSuffix(host, "."))
+func normalizeHost(host string) (string, error) {
+	host = strings.TrimSuffix(host, ".")
+	address, err := netip.ParseAddr(host)
+	if err != nil {
+		if strings.ContainsRune(host, '%') {
+			return "", errInvalidEntry
+		}
+		return strings.ToLower(host), nil
+	}
+	if address.Zone() != "" {
+		return "", errInvalidEntry
+	}
+	return address.Unmap().String(), nil
 }
 
 func defaultEndpointName(protocol domain.Protocol) string {

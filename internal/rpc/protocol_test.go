@@ -296,6 +296,16 @@ func TestProcessLifecycleErrorsUseStableRedactedCodes(t *testing.T) {
 	}
 }
 
+func TestJoinedRollbackFailureTakesPrecedenceOverProcessStuck(t *testing.T) {
+	t.Parallel()
+
+	joined := errors.Join(ErrRollbackFailure, ErrProcessStuck)
+	response := responseForError("request-1", joined)
+	if response.Error == nil || response.Error.Code != CodeRollbackFailure {
+		t.Fatalf("responseForError(joined rollback failure) = %#v, want %q", response, CodeRollbackFailure)
+	}
+}
+
 func TestResponseValidationRequiresStableRedactedShape(t *testing.T) {
 	t.Parallel()
 

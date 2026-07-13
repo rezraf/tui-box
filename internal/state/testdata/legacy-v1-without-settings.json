@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "revision": 7,
+  "subscriptions": [
+    {
+      "id": "legacy-subscription",
+      "name": "Legacy Subscription",
+      "secret_ref": "legacy-secret",
+      "format": "uri-list",
+      "refresh_interval_seconds": 900,
+      "last_error": "legacy refresh warning"
+    }
+  ],
+  "endpoints": [
+    {
+      "id": "legacy-endpoint",
+      "subscription_id": "legacy-subscription",
+      "name": "Legacy Endpoint",
+      "protocol": "shadowsocks",
+      "host": "legacy.example.com",
+      "port": 8388,
+      "password": "legacy-password",
+      "method": "aes-256-gcm",
+      "tls": {
+        "enabled": false
+      },
+      "transport": {
+        "type": ""
+      }
+    }
+  ]
+}

@@ -2,6 +2,7 @@ package state
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -10,25 +11,27 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode"
 	"unicode/utf8"
 
 	"github.com/rezraf/tui-box/internal/domain"
 	"github.com/rezraf/tui-box/internal/filelock"
 	"github.com/rezraf/tui-box/internal/securepath"
+	"github.com/rezraf/tui-box/internal/strictjson"
+	"github.com/rezraf/tui-box/internal/terminaltext"
 	"golang.org/x/sys/unix"
 )
 
 const (
-	CurrentSchemaVersion    = 1
-	StateFileName           = "state.json"
-	StateLockFileName       = ".state.lock"
-	MaxStateSubscriptions   = 1024
-	MaxStateEndpoints       = 10_000
-	maxStateFileBytes       = 64 << 20
-	maxLastErrorBytes       = 4096
-	maxRefreshInterval      = 366 * 24 * 60 * 60
-	defaultOperationTimeout = 5 * time.Second
+	CurrentSchemaVersion     = 1
+	StateFileName            = "state.json"
+	StateLockFileName        = ".state.lock"
+	MaxStateSubscriptions    = 1024
+	MaxStateEndpoints        = 10_000
+	maxStateFileBytes        = 64 << 20
+	maxLastErrorBytes        = 4096
+	maxRefreshInterval       = 366 * 24 * 60 * 60
+	endpointIdentityKeyBytes = 32
+	defaultOperationTimeout  = 5 * time.Second
 )
 
 var (
@@ -39,7 +42,8 @@ var (
 )
 
 type Settings struct {
-	TelemetryEnabled bool `json:"telemetry_enabled"`
+	TelemetryEnabled    bool   `json:"telemetry_enabled"`
+	EndpointIdentityKey string `json:"endpoint_identity_key,omitempty"`
 }
 
 type Snapshot struct {
@@ -103,6 +107,9 @@ func (store *Store) SaveContext(ctx context.Context, snapshot Snapshot) error {
 
 	if err := validateSnapshot(snapshot); err != nil {
 		return errInvalidState
+	}
+	if _, err := encodeSnapshot(snapshot); err != nil {
+		return err
 	}
 	lock, err := store.acquireFileLock(ctx)
 	if err != nil {
@@ -287,6 +294,12 @@ func (store *Store) loadLocked() (Snapshot, error) {
 		return Snapshot{}, errInvalidState
 	}
 
+	if err := strictjson.ValidateUniqueObjectFields(io.LimitReader(file, maxStateFileBytes+1), strictjson.FoldedKeys); err != nil {
+		return Snapshot{}, errInvalidState
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return Snapshot{}, errStateStore
+	}
 	decoder := json.NewDecoder(io.LimitReader(file, maxStateFileBytes+1))
 	decoder.DisallowUnknownFields()
 	var snapshot Snapshot
@@ -309,13 +322,9 @@ func (store *Store) writeLocked(snapshot Snapshot) error {
 	if err := validatePrivateStateFileIfPresent(store.root); err != nil {
 		return errStateStore
 	}
-	encoded, err := json.MarshalIndent(snapshot, "", "  ")
+	encoded, err := encodeSnapshot(snapshot)
 	if err != nil {
-		return errStateStore
-	}
-	encoded = append(encoded, '\n')
-	if len(encoded) > maxStateFileBytes {
-		return errInvalidState
+		return err
 	}
 
 	temporary, temporaryName, err := securepath.CreatePrivateTemp(store.root, "."+StateFileName+"-")
@@ -352,6 +361,18 @@ func (store *Store) writeLocked(snapshot Snapshot) error {
 	return nil
 }
 
+func encodeSnapshot(snapshot Snapshot) ([]byte, error) {
+	encoded, err := json.MarshalIndent(snapshot, "", "  ")
+	if err != nil {
+		return nil, errStateStore
+	}
+	encoded = append(encoded, '\n')
+	if len(encoded) > maxStateFileBytes {
+		return nil, errInvalidState
+	}
+	return encoded, nil
+}
+
 func incrementRevision(snapshot *Snapshot) error {
 	if snapshot.Revision == math.MaxUint64 {
 		return errInvalidState
@@ -363,7 +384,8 @@ func incrementRevision(snapshot *Snapshot) error {
 func validateSnapshot(snapshot Snapshot) error {
 	if snapshot.SchemaVersion != CurrentSchemaVersion ||
 		len(snapshot.Subscriptions) > MaxStateSubscriptions ||
-		len(snapshot.Endpoints) > MaxStateEndpoints {
+		len(snapshot.Endpoints) > MaxStateEndpoints ||
+		!validEndpointIdentityKey(snapshot.Settings.EndpointIdentityKey) {
 		return errInvalidState
 	}
 	subscriptionIDs := make(map[string]struct{}, len(snapshot.Subscriptions))
@@ -397,7 +419,8 @@ func validateSubscription(subscription domain.Subscription) error {
 	if !validStateString(subscription.ID, domain.MaxIDLength, true) ||
 		!validStateString(subscription.Name, domain.MaxNameLength, true) ||
 		!validStateString(subscription.SecretRef, domain.MaxCredentialLength, true) ||
-		!validStateString(subscription.LastError, maxLastErrorBytes, false) {
+		!validStateString(subscription.LastError, maxLastErrorBytes, false) ||
+		!validStateString(subscription.RefreshToken, domain.MaxIDLength, false) {
 		return errInvalidState
 	}
 	if subscription.RefreshIntervalSeconds < 0 || subscription.RefreshIntervalSeconds > maxRefreshInterval {
@@ -437,6 +460,14 @@ func hasSubscription(subscriptions []domain.Subscription, subscriptionID string)
 	return false
 }
 
+func validEndpointIdentityKey(value string) bool {
+	if value == "" {
+		return true
+	}
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded) == endpointIdentityKeyBytes
+}
+
 func validStateString(value string, maxBytes int, required bool) bool {
 	if required && strings.TrimSpace(value) == "" {
 		return false
@@ -444,12 +475,7 @@ func validStateString(value string, maxBytes int, required bool) bool {
 	if !utf8.ValidString(value) || len(value) > maxBytes {
 		return false
 	}
-	for _, character := range value {
-		if unicode.IsControl(character) {
-			return false
-		}
-	}
-	return true
+	return terminaltext.Valid(value)
 }
 
 func validatePrivateStateFileIfPresent(root *os.Root) error {

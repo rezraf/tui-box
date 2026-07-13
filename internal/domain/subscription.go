@@ -19,4 +19,5 @@ type Subscription struct {
 	RefreshIntervalSeconds int                `json:"refresh_interval_seconds"`
 	LastRefresh            *time.Time         `json:"last_refresh,omitempty"`
 	LastError              string             `json:"last_error,omitempty"`
+	RefreshToken           string             `json:"refresh_token,omitempty"`
 }

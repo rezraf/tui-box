@@ -312,10 +312,10 @@ func codeForError(err error) Code {
 		return CodeAccessDenied
 	case errors.Is(err, ErrCoreValidation):
 		return CodeCoreValidation
-	case errors.Is(err, ErrProcessStuck):
-		return CodeProcessStuck
 	case errors.Is(err, ErrRollbackFailure):
 		return CodeRollbackFailure
+	case errors.Is(err, ErrProcessStuck):
+		return CodeProcessStuck
 	case errors.Is(err, ErrProcessFailure):
 		return CodeProcessFailure
 	case errors.Is(err, ErrUnavailable):

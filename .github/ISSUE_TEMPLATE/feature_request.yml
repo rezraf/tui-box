@@ -1,0 +1,47 @@
+name: Feature request
+description: Propose a focused TuiBox improvement
+title: "feature: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Explain the user problem first. Changes to the root boundary, RPC, updates, telemetry, credential storage, or supported formats require explicit security and compatibility analysis.
+  - type: textarea
+    id: problem
+    attributes:
+      label: User problem
+      description: What cannot be done safely or clearly today?
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: Describe observable behavior, not only an implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Include existing commands or workarounds you evaluated.
+    validations:
+      required: true
+  - type: textarea
+    id: security
+    attributes:
+      label: Security, privacy, and compatibility impact
+      description: Note new inputs, privileges, network destinations, stored data, telemetry fields, provider formats, or platform assumptions.
+    validations:
+      required: true
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope checks
+      options:
+        - label: This request does not contain credentials, subscription data, personal data, or undisclosed vulnerability details.
+          required: true
+        - label: I reviewed the documented v0.1 limitations and non-goals.
+          required: true

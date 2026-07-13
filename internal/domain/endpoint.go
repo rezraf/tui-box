@@ -5,8 +5,9 @@ import (
 	"fmt"
 	"net"
 	"strings"
-	"unicode"
 	"unicode/utf8"
+
+	"github.com/rezraf/tui-box/internal/terminaltext"
 )
 
 const (
@@ -451,10 +452,8 @@ func validateString(name, value string, maxBytes int, required bool) error {
 	if len(value) > maxBytes {
 		return fmt.Errorf("%s exceeds %d bytes", name, maxBytes)
 	}
-	for _, character := range value {
-		if unicode.IsControl(character) {
-			return fmt.Errorf("%s contains control characters", name)
-		}
+	if !terminaltext.Valid(value) {
+		return fmt.Errorf("%s contains terminal-unsafe characters", name)
 	}
 	return nil
 }

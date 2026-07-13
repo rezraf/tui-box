@@ -73,24 +73,44 @@ func (checker *Checker) Check(ctx context.Context, endpoints []domain.Endpoint) 
 	}
 
 	results := make([]Result, len(endpoints))
-	jobs := make(chan int, len(endpoints))
-	for index := range endpoints {
-		jobs <- index
+	for index, endpoint := range endpoints {
+		results[index] = Result{EndpointID: endpoint.ID, Protocol: endpoint.Protocol}
 	}
-	close(jobs)
 
+	jobs := make(chan int)
 	workers := min(checker.maxParallel, len(endpoints))
 	done := make(chan struct{}, workers)
 	for range workers {
 		go func() {
+			defer func() { done <- struct{}{} }()
 			for index := range jobs {
+				if ctx.Err() != nil {
+					return
+				}
 				results[index] = checker.checkOne(ctx, endpoints[index])
 			}
-			done <- struct{}{}
 		}()
 	}
+
+sendJobs:
+	for index := range endpoints {
+		select {
+		case jobs <- index:
+		case <-ctx.Done():
+			break sendJobs
+		}
+	}
+	close(jobs)
 	for range workers {
 		<-done
+	}
+	if err := ctx.Err(); err != nil {
+		for index := range results {
+			if results[index].Status == "" {
+				results[index].Status = StatusUnavailable
+				results[index].Error = err.Error()
+			}
+		}
 	}
 	return results
 }
@@ -108,14 +128,34 @@ func (checker *Checker) checkOne(ctx context.Context, endpoint domain.Endpoint) 
 		return result
 	}
 
+	if err := ctx.Err(); err != nil {
+		result.Status = StatusUnavailable
+		result.Error = err.Error()
+		return result
+	}
+
+	address := net.JoinHostPort(endpoint.Host, strconv.Itoa(endpoint.Port))
 	probeContext, cancel := context.WithTimeout(ctx, checker.timeout)
 	defer cancel()
 	started := time.Now()
-	connection, err := checker.dialer.DialContext(probeContext, "tcp", net.JoinHostPort(endpoint.Host, strconv.Itoa(endpoint.Port)))
+	connection, err := checker.dialer.DialContext(probeContext, "tcp", address)
 	elapsed := time.Since(started)
+	if contextErr := probeContext.Err(); contextErr != nil {
+		if connection != nil {
+			_ = connection.Close()
+		}
+		result.Status = StatusUnavailable
+		result.Error = contextErr.Error()
+		return result
+	}
 	if err != nil {
 		result.Status = StatusUnavailable
-		result.Error = redact.StringSensitive(err.Error(), endpoint.Host, endpoint.UUID, endpoint.Password)
+		result.Error = redact.StringSensitive(err.Error(), address, endpoint.Host, endpoint.UUID, endpoint.Password)
+		return result
+	}
+	if connection == nil {
+		result.Status = StatusUnavailable
+		result.Error = "latency dialer returned nil connection"
 		return result
 	}
 	_ = connection.Close()

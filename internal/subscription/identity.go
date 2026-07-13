@@ -72,7 +72,14 @@ type tuicIdentityV1 struct {
 	ZeroRTT           bool                         `json:"zero_rtt,omitempty"`
 }
 
+func EndpointFingerprint(endpoint domain.Endpoint) (string, error) {
+	return endpointID(endpoint)
+}
+
 func endpointID(endpoint domain.Endpoint) (string, error) {
+	if err := normalizeEndpoint(&endpoint); err != nil {
+		return "", fmt.Errorf("normalize endpoint identity: %w", err)
+	}
 	encoded, err := json.Marshal(canonicalEndpointIdentityV1(endpoint))
 	if err != nil {
 		return "", fmt.Errorf("marshal endpoint identity: %w", err)

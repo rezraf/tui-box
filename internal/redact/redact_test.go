@@ -50,6 +50,18 @@ func TestStringRemovesCredentialAndTokenLikeValues(t *testing.T) {
 	}
 }
 
+func TestStringRedactsQuotedJSONCredentialsWithoutLeakingRPCPayload(t *testing.T) {
+	t.Parallel()
+
+	input := `rpc failed: {"password":"p\\\"rivate","token":"rpc-token","api_key":"rpc-key","authorization":"Bearer rpc-secret","endpoint":"9edge.private.example:443"}`
+	got := String(input)
+	for _, secret := range []string{`p\\\"rivate`, "rpc-token", "rpc-key", "rpc-secret", "9edge.private.example:443"} {
+		if strings.Contains(got, secret) {
+			t.Errorf("String() retained %q in %q", secret, got)
+		}
+	}
+}
+
 func TestStringRemovesUUIDsAndEndpointAddresses(t *testing.T) {
 	t.Parallel()
 
@@ -66,6 +78,63 @@ func TestStringRemovesUUIDsAndEndpointAddresses(t *testing.T) {
 	}
 }
 
+func TestStringRedactsCompleteIPv4AndDigitLeadingHostnamePorts(t *testing.T) {
+	t.Parallel()
+
+	input := "dial 203.0.113.42:8443 then 9edge.private.example:443"
+	want := "dial [redacted-address] then [redacted-address]"
+	if got := String(input); got != want {
+		t.Fatalf("String(%q) = %q, want %q", input, got, want)
+	}
+}
+
+func TestStringRemovesIPv6Forms(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{name: "compressed", input: "dial 2001:db8::1 failed", want: "dial [redacted-address] failed"},
+		{name: "loopback", input: "dial ::1 failed", want: "dial [redacted-address] failed"},
+		{name: "full", input: "dial 2001:0db8:0000:0000:0000:ff00:0042:8329 failed", want: "dial [redacted-address] failed"},
+		{name: "zone", input: "dial fe80::1%en0 failed", want: "dial [redacted-address] failed"},
+		{name: "IPv4-mapped", input: "dial ::ffff:192.0.2.128 failed", want: "dial [redacted-address] failed"},
+		{name: "bracketed", input: "dial [2001:db8::1] failed", want: "dial [redacted-address] failed"},
+		{name: "bracketed with port", input: "dial [fe80::1%en0]:443 failed", want: "dial [redacted-address] failed"},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if got := String(test.input); got != test.want {
+				t.Fatalf("String(%q) = %q, want %q", test.input, got, test.want)
+			}
+		})
+	}
+}
+
+func TestStringHandlesRedactionEdgesWithoutChangingSurroundingText(t *testing.T) {
+	t.Parallel()
+
+	input := "Authorization: Bearer short.jwt, see https://example.com/path, then retry at 12:34."
+	want := "[redacted], see [redacted-url], then retry at 12:34."
+	if got := String(input); got != want {
+		t.Fatalf("String() = %q, want %q", got, want)
+	}
+}
+
+func TestStringPreservesOrdinaryTimesAndLongWords(t *testing.T) {
+	t.Parallel()
+
+	input := "retry at 09:45 after antidisestablishmentarianism"
+	if got := String(input); got != input {
+		t.Fatalf("String(%q) = %q", input, got)
+	}
+}
+
 func TestStringRemovesExplicitSensitiveValuesAndKeepsOrdinaryText(t *testing.T) {
 	t.Parallel()
 
@@ -79,6 +148,25 @@ func TestStringRemovesExplicitSensitiveValuesAndKeepsOrdinaryText(t *testing.T) 
 	if got := String(ordinary); got != ordinary {
 		t.Fatalf("String() changed ordinary text to %q", got)
 	}
+}
+
+func FuzzStringNoPanic(f *testing.F) {
+	for _, seed := range []string{
+		"",
+		"ordinary text",
+		"Authorization: Bearer short.jwt",
+		"https://example.com/path?token=secret",
+		"2001:db8::1 [fe80::1%en0]:443",
+		string([]byte{0xff, 0xfe, 0xfd}),
+	} {
+		f.Add(seed)
+	}
+
+	f.Fuzz(func(t *testing.T, input string) {
+		_ = String(input)
+		_ = StringSensitive(input, input, "", "duplicate", "duplicate")
+		_ = Error(errors.New(input), input)
+	})
 }
 
 func TestErrorReturnsAPlainRedactedError(t *testing.T) {

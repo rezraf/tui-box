@@ -11,6 +11,7 @@ import (
 
 	"github.com/rezraf/tui-box/internal/filelock"
 	"github.com/rezraf/tui-box/internal/securepath"
+	"github.com/rezraf/tui-box/internal/strictjson"
 	"golang.org/x/sys/unix"
 )
 
@@ -188,6 +189,12 @@ func (store *fileStore) loadLocked() (map[string]string, error) {
 		return nil, errFallbackStore
 	}
 
+	if err := strictjson.ValidateUniqueObjectFields(io.LimitReader(file, maxFallbackFileBytes+1), strictjson.ExactKeys); err != nil {
+		return nil, errFallbackStore
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return nil, errFallbackStore
+	}
 	decoder := json.NewDecoder(io.LimitReader(file, maxFallbackFileBytes+1))
 	var values map[string]string
 	if err := decoder.Decode(&values); err != nil {

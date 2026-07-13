@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -120,8 +121,121 @@ func TestCheckerAppliesPerProbeTimeoutAndHonorsParentCancellation(t *testing.T) 
 	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
 		t.Fatalf("canceled probe took %s", elapsed)
 	}
-	if len(results) != 1 || !strings.Contains(results[0].Error, "canceled") {
-		t.Fatalf("canceled result = %#v", results)
+	if len(results) != 1 || results[0].Status != StatusUnavailable || !strings.Contains(results[0].Error, "canceled") {
+		t.Fatalf("canceled result = %#v, want unavailable cancellation error", results)
+	}
+}
+
+func TestCheckerCancellationStopsUntouchedProbesAndPreservesOrder(t *testing.T) {
+	t.Parallel()
+
+	dialer := &cancelRecordingDialer{entered: make(chan struct{})}
+	checker, err := NewChecker(Config{Dialer: dialer, Timeout: time.Second, MaxParallel: 1})
+	if err != nil {
+		t.Fatalf("NewChecker() error = %v", err)
+	}
+	endpoints := []domain.Endpoint{
+		latencyEndpoint("first", domain.ProtocolVLESS),
+		latencyEndpoint("second", domain.ProtocolVMess),
+		latencyEndpoint("third", domain.ProtocolTrojan),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan []Result, 1)
+	go func() { done <- checker.Check(ctx, endpoints) }()
+	<-dialer.entered
+	cancel()
+
+	results := <-done
+	if got := dialer.callCount.Load(); got != 1 {
+		t.Fatalf("dial calls = %d, want only the in-flight probe", got)
+	}
+	for index, result := range results {
+		if result.EndpointID != endpoints[index].ID {
+			t.Fatalf("result %d ID = %q, want %q", index, result.EndpointID, endpoints[index].ID)
+		}
+		if result.Status != StatusUnavailable || !strings.Contains(result.Error, "canceled") {
+			t.Fatalf("result %d = %#v, want canceled unavailable result", index, result)
+		}
+	}
+}
+
+func TestCheckerClosesConnectionReturnedAfterCancellation(t *testing.T) {
+	t.Parallel()
+
+	dialer := newLateConnectionDialer()
+	checker, err := NewChecker(Config{Dialer: dialer, Timeout: time.Second, MaxParallel: 1})
+	if err != nil {
+		t.Fatalf("NewChecker() error = %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan []Result, 1)
+	go func() {
+		done <- checker.Check(ctx, []domain.Endpoint{latencyEndpoint("late", domain.ProtocolVLESS)})
+	}()
+	<-dialer.entered
+	cancel()
+	close(dialer.release)
+
+	result := (<-done)[0]
+	if result.Status != StatusUnavailable || !strings.Contains(result.Error, "canceled") {
+		t.Fatalf("late result = %#v, want canceled unavailable result", result)
+	}
+	if !dialer.connection.closed.Load() {
+		t.Fatal("connection returned after cancellation was not closed")
+	}
+}
+
+func TestCheckerPrefersCancellationOverLateDialError(t *testing.T) {
+	t.Parallel()
+
+	dialer := &lateErrorDialer{entered: make(chan struct{}), release: make(chan struct{})}
+	checker, err := NewChecker(Config{Dialer: dialer, Timeout: time.Second, MaxParallel: 1})
+	if err != nil {
+		t.Fatalf("NewChecker() error = %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan []Result, 1)
+	go func() {
+		done <- checker.Check(ctx, []domain.Endpoint{latencyEndpoint("late-error", domain.ProtocolVLESS)})
+	}()
+	<-dialer.entered
+	cancel()
+	close(dialer.release)
+
+	result := (<-done)[0]
+	if result.Status != StatusUnavailable || !strings.Contains(result.Error, "canceled") {
+		t.Fatalf("late error result = %#v, want canceled unavailable result", result)
+	}
+	if strings.Contains(result.Error, "private") {
+		t.Fatalf("late error leaked dial failure: %q", result.Error)
+	}
+}
+
+func TestCheckerHandlesNilConnectionWithoutPanic(t *testing.T) {
+	t.Parallel()
+
+	checker, err := NewChecker(Config{Dialer: nilConnectionDialer{}, Timeout: time.Second, MaxParallel: 1})
+	if err != nil {
+		t.Fatalf("NewChecker() error = %v", err)
+	}
+
+	results := checker.Check(context.Background(), []domain.Endpoint{latencyEndpoint("nil-connection", domain.ProtocolVLESS)})
+	if len(results) != 1 || results[0].Status != StatusUnavailable || !strings.Contains(results[0].Error, "nil connection") {
+		t.Fatalf("nil connection result = %#v, want unavailable error", results)
+	}
+}
+
+func TestCheckerReturnsEmptyResultsForEmptyInput(t *testing.T) {
+	t.Parallel()
+
+	checker, err := NewChecker(Config{Timeout: time.Second, MaxParallel: 1})
+	if err != nil {
+		t.Fatalf("NewChecker() error = %v", err)
+	}
+
+	results := checker.Check(context.Background(), nil)
+	if results == nil || len(results) != 0 {
+		t.Fatalf("Check(nil) = %#v, want non-nil empty results", results)
 	}
 }
 
@@ -137,7 +251,7 @@ func TestCheckerRedactsDialErrors(t *testing.T) {
 	if result.Status != StatusUnavailable {
 		t.Fatalf("status = %q, want unavailable", result.Status)
 	}
-	for _, private := range []string{"edge.private.example", "super-secret-value"} {
+	for _, private := range []string{"edge.private.example:443", "edge.private.example", ":443", "super-secret-value"} {
 		if strings.Contains(result.Error, private) {
 			t.Fatalf("error retained %q: %q", private, result.Error)
 		}
@@ -161,8 +275,18 @@ func TestBestChoosesLowestSuccessfulLatencyWithIDTieBreak(t *testing.T) {
 		t.Fatalf("Best() ID = %q, want a", best.EndpointID)
 	}
 
-	if _, err := Best([]Result{{EndpointID: "x", Status: StatusUnsupported}}); !errors.Is(err, ErrNoAvailableEndpoint) {
-		t.Fatalf("Best() error = %v, want ErrNoAvailableEndpoint", err)
+	for name, failed := range map[string][]Result{
+		"empty": nil,
+		"all failed": {
+			{EndpointID: "unavailable", Status: StatusUnavailable, Duration: time.Millisecond},
+			{EndpointID: "unsupported", Status: StatusUnsupported},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got, err := Best(failed); got != (Result{}) || !errors.Is(err, ErrNoAvailableEndpoint) {
+				t.Fatalf("Best() = %#v, %v, want zero result and ErrNoAvailableEndpoint", got, err)
+			}
+		})
 	}
 }
 
@@ -272,6 +396,68 @@ func (dialer *contextDialer) DialContext(ctx context.Context, _, _ string) (net.
 	dialer.entered <- deadline
 	<-ctx.Done()
 	return nil, ctx.Err()
+}
+
+type cancelRecordingDialer struct {
+	entered   chan struct{}
+	callCount atomic.Int32
+}
+
+func (dialer *cancelRecordingDialer) DialContext(ctx context.Context, _, _ string) (net.Conn, error) {
+	if dialer.callCount.Add(1) == 1 {
+		close(dialer.entered)
+	}
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+type lateConnectionDialer struct {
+	entered    chan struct{}
+	release    chan struct{}
+	connection *trackingConnection
+}
+
+func newLateConnectionDialer() *lateConnectionDialer {
+	client, server := net.Pipe()
+	_ = server.Close()
+	return &lateConnectionDialer{
+		entered:    make(chan struct{}),
+		release:    make(chan struct{}),
+		connection: &trackingConnection{Conn: client},
+	}
+}
+
+func (dialer *lateConnectionDialer) DialContext(context.Context, string, string) (net.Conn, error) {
+	close(dialer.entered)
+	<-dialer.release
+	return dialer.connection, nil
+}
+
+type trackingConnection struct {
+	net.Conn
+	closed atomic.Bool
+}
+
+func (connection *trackingConnection) Close() error {
+	connection.closed.Store(true)
+	return connection.Conn.Close()
+}
+
+type lateErrorDialer struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (dialer *lateErrorDialer) DialContext(context.Context, string, string) (net.Conn, error) {
+	close(dialer.entered)
+	<-dialer.release
+	return nil, errors.New("late private dial failure")
+}
+
+type nilConnectionDialer struct{}
+
+func (nilConnectionDialer) DialContext(context.Context, string, string) (net.Conn, error) {
+	return nil, nil
 }
 
 type errorDialer struct{ err error }

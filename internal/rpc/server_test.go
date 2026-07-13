@@ -433,6 +433,51 @@ func TestServerAcceptsPrivateConfiguredGroupSocketDirectory(t *testing.T) {
 	}
 }
 
+func TestInstallerCreatedSocketDirectorySupportsAuthorizedClient(t *testing.T) {
+	directory := os.Getenv("TUIBOX_TEST_INSTALLER_RUN_DIR")
+	if directory == "" {
+		t.Skip("installer runtime directory not provided")
+	}
+	info, err := os.Lstat(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o750 {
+		t.Fatalf("installer runtime directory mode = %o, want 750", info.Mode().Perm())
+	}
+	_, directoryGID, ok := fileIdentity(info)
+	if !ok || directoryGID != os.Getegid() {
+		t.Fatalf("installer runtime directory GID = %d, %v; want %d", directoryGID, ok, os.Getegid())
+	}
+
+	server, err := NewServer(ServerConfig{
+		SocketPath:  filepath.Join(directory, "tuiboxd.sock"),
+		SocketGID:   os.Getegid(),
+		AllowedUIDs: []int{os.Geteuid()},
+		Handler:     &testHandler{},
+	})
+	if err != nil {
+		t.Fatalf("NewServer(installer directory) failed: %v", err)
+	}
+	startServer(t, server)
+
+	socketInfo, err := os.Lstat(server.SocketPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, socketGID, ok := fileIdentity(socketInfo)
+	if socketInfo.Mode().Perm() != 0o660 || !ok || socketGID != os.Getegid() {
+		t.Fatalf("socket mode/GID = %o/%d (%v), want 660/%d", socketInfo.Mode().Perm(), socketGID, ok, os.Getegid())
+	}
+	client, err := NewClient(server.SocketPath(), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Health(context.Background()); err != nil {
+		t.Fatalf("authorized client traversal failed: %v", err)
+	}
+}
+
 func TestServerRejectsUnsafeSocketPathsAndPreservesFiles(t *testing.T) {
 	t.Parallel()
 

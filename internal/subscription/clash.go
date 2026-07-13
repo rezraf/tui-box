@@ -1,9 +1,7 @@
 package subscription
 
 import (
-	"bytes"
 	"errors"
-	"io"
 	"strconv"
 	"strings"
 
@@ -129,28 +127,24 @@ func (value *yamlMbps) UnmarshalYAML(node *yaml.Node) error {
 }
 
 func parseClash(subscriptionID string, content []byte) (ParseResult, error) {
-	var document clashDocument
-	decoder := yaml.NewDecoder(bytes.NewReader(content))
-	if err := decoder.Decode(&document); err != nil {
-		return ParseResult{}, errMalformedDocument
-	}
-	var trailing yaml.Node
-	if err := decoder.Decode(&trailing); err != io.EOF {
-		return ParseResult{}, errMalformedDocument
-	}
-	if len(document.Proxies) > MaxEntries {
-		return ParseResult{}, errTooManyEntries
+	entries, err := scanClashEntries(content)
+	if err != nil {
+		return ParseResult{}, err
 	}
 	result := ParseResult{Format: domain.SubscriptionFormatClash}
 	seen := make(map[string]struct{})
-	for index := range document.Proxies {
+	for index, entry := range entries {
 		entryNumber := index + 1
-		node := &document.Proxies[index]
-		encoded, err := yaml.Marshal(node)
-		if err != nil || len(encoded) > MaxEntryBytes {
+		if entry.oversized {
 			result.Warnings = append(result.Warnings, oversizedWarning(subscriptionID, entryNumber))
 			continue
 		}
+		var nodes []yaml.Node
+		if err := yaml.Unmarshal(dedentYAMLEntry(content[entry.start:entry.end], entry.indent), &nodes); err != nil || len(nodes) != 1 {
+			result.Warnings = append(result.Warnings, invalidWarning(subscriptionID, entryNumber))
+			continue
+		}
+		node := &nodes[0]
 		if containsYAMLAlias(node) {
 			result.Warnings = append(result.Warnings, invalidWarning(subscriptionID, entryNumber))
 			continue

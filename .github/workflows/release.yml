@@ -1,0 +1,99 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+concurrency:
+  group: release-publication
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  release:
+    name: Build, attest, and publish release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out full history
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0, source: https://github.com/actions/checkout
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate stable mainline release tag
+        shell: bash
+        run: |
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            printf 'Release tag must be stable semantic version: %s\n' "$GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || {
+            printf 'Release tag must point to a commit on main\n' >&2
+            exit 1
+          }
+      - name: Reject non-monotonic stable release tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          release_metadata="$RUNNER_TEMP/published-releases.json"
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" >"$release_metadata"
+          sh scripts/stable-release.sh require-newer "$GITHUB_REF_NAME" "$release_metadata" >/dev/null
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0, source: https://github.com/actions/setup-go
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Check shell syntax
+        run: sh -n install.sh uninstall.sh scripts/cross-build.sh scripts/packaging_test.sh scripts/release_snapshot_test.sh scripts/stable-release.sh scripts/stable_release_test.sh
+      - name: Run offline tests
+        run: go test ./...
+      - name: Run race detector
+        run: go test -race ./...
+      - name: Run vet
+        run: go vet ./...
+      - name: Test installer lifecycle
+        run: ./scripts/packaging_test.sh
+      - name: Build and upload draft release
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3, source: https://github.com/goreleaser/goreleaser-action
+        with:
+          distribution: goreleaser
+          version: v2.17.0
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Attest release archives
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1, source: https://github.com/actions/attest-build-provenance
+        with:
+          subject-checksums: dist/checksums.txt
+      - name: Attest release checksums
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1, source: https://github.com/actions/attest-build-provenance
+        with:
+          subject-path: dist/checksums.txt
+      - name: Verify release is still draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          release_is_draft=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)
+          test "$release_is_draft" = true || {
+            printf 'Release became public before all attestations completed\n' >&2
+            exit 1
+          }
+      - name: Publish attested release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          release_id=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" --jq .id)
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+            -F draft=false \
+            -F prerelease=false \
+            -f make_latest=true >/dev/null
