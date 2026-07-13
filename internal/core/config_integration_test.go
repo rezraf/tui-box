@@ -52,7 +52,7 @@ var pinnedCoreArtifacts = map[string]coreArtifact{
 	},
 }
 
-func TestGeneratedConfigsPassPinnedSingBoxCheck(t *testing.T) {
+func TestGeneratedConfigsPassPinnedSingBoxCheckThroughRunnerStdin(t *testing.T) {
 	executable := os.Getenv("TUIBOX_SING_BOX")
 	if executable == "" {
 		if testing.Short() {

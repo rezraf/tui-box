@@ -13,7 +13,8 @@ import (
 
 func configureCommand(command *exec.Cmd, operation string, request ConnectionRequest) {
 	attributes := &syscall.SysProcAttr{Setpgid: true}
-	if operation == commandRun && request.Mode == domain.ConnectionModeProxy {
+	if operation == commandRun && request.Mode == domain.ConnectionModeProxy &&
+		(request.UID != os.Geteuid() || request.GID != os.Getegid()) {
 		attributes.Credential = &syscall.Credential{
 			Uid:    uint32(request.UID),
 			Gid:    uint32(request.GID),

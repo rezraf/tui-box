@@ -5,7 +5,9 @@ package core
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"math"
 	"os"
 	"os/exec"
@@ -252,7 +254,7 @@ func TestRunnerPrepareCreatesUniquePrivateAtomicConfigs(t *testing.T) {
 	}
 }
 
-func TestRunnerUsesOnlyFixedInheritedDescriptorCommands(t *testing.T) {
+func TestRunnerUsesOnlyFixedStdinCommands(t *testing.T) {
 	t.Parallel()
 
 	runner, _ := newTestRunner(t, buildCoreHelper(t))
@@ -262,13 +264,13 @@ func TestRunnerUsesOnlyFixedInheritedDescriptorCommands(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := runner.Check(context.Background(), prepared); err != nil {
-		t.Fatalf("Check() did not use the fixed descriptor command: %v", err)
+		t.Fatalf("Check() did not use the fixed stdin command: %v", err)
 	}
 	process, err := runner.Start(context.Background(), prepared)
 	if err != nil {
-		t.Fatalf("Start() did not use the fixed descriptor command: %v", err)
+		t.Fatalf("Start() did not use the fixed stdin command: %v", err)
 	}
-	waitForOutput(t, process, "config-readable")
+	waitForOutput(t, process, "config-stdin")
 	if err := process.Signal(syscall.SIGTERM); err != nil {
 		t.Fatal(err)
 	}
@@ -410,7 +412,7 @@ func TestProcessAPIHandlesGracefulSignalKillWaitAndBoundedOutput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Start() returned an unexpected error: %v", err)
 	}
-	waitForOutput(t, process, "config-readable")
+	waitForOutput(t, process, "config-stdin")
 	if err := process.Signal(syscall.SIGTERM); err != nil {
 		t.Fatalf("Signal() returned an unexpected error: %v", err)
 	}
@@ -481,9 +483,55 @@ func TestRunnerCheckAndStartAreContextAwareAndErrorsDoNotLeakSecrets(t *testing.
 	}
 }
 
-func TestProxyExecutionDropsIdentityAndReadsInheritedRootOwnedConfig(t *testing.T) {
+func TestProxyCommandSkipsCredentialWhenIdentityAlreadyMatches(t *testing.T) {
+	t.Parallel()
+
+	request := validConnectionRequest(domain.ConnectionModeProxy, domain.RouteModeGlobal)
+	request.UID = os.Geteuid()
+	request.GID = os.Getegid()
+	command := &exec.Cmd{}
+	configureCommand(command, commandRun, request)
+	if command.SysProcAttr == nil || !command.SysProcAttr.Setpgid {
+		t.Fatalf("proxy process attributes = %#v, want process group", command.SysProcAttr)
+	}
+	if command.SysProcAttr.Credential != nil {
+		t.Fatalf("same-identity proxy credential = %#v, want nil", command.SysProcAttr.Credential)
+	}
+}
+
+func TestProxyExecutionAsOrdinaryUserConsumesExactGeneratedConfigFromStdin(t *testing.T) {
+	uid, gid := os.Geteuid(), os.Getegid()
+	if uid == 0 || gid == 0 {
+		uid, gid = 65534, 65534
+	}
+
+	runner, _ := newTestRunner(t, buildCoreHelper(t))
+	request := validConnectionRequest(domain.ConnectionModeProxy, domain.RouteModeGlobal)
+	request.UID = uid
+	request.GID = gid
+	prepared, err := runner.Prepare(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.Check(context.Background(), prepared); err != nil {
+		t.Fatal(err)
+	}
+	process, err := runner.Start(context.Background(), prepared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForOutput(t, process, expectedConfigOutput(t, request, uid, gid))
+	if err := process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	if err := process.Wait(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestProxyExecutionDropsIdentityAndReadsRootOwnedConfigFromStdin(t *testing.T) {
 	if os.Geteuid() != 0 {
-		t.Skip("requires root to prove credential drop before inherited config read")
+		t.Skip("requires root to prove credential drop before stdin config read")
 	}
 
 	runner, runtimeDirectory := newTestRunner(t, buildCoreHelper(t))
@@ -511,7 +559,7 @@ func TestProxyExecutionDropsIdentityAndReadsInheritedRootOwnedConfig(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	waitForOutput(t, process, "uid=65534 gid=65534 config-readable")
+	waitForOutput(t, process, expectedConfigOutput(t, request, 65534, 65534))
 	if err := process.Signal(syscall.SIGTERM); err != nil {
 		t.Fatal(err)
 	}
@@ -548,6 +596,9 @@ func trustedNoopExecutable(t *testing.T) string {
 
 func trustedDirectory(t *testing.T) string {
 	t.Helper()
+	if os.Geteuid() == 0 {
+		return rootExecutableDirectory(t)
+	}
 	cache, err := os.UserCacheDir()
 	if err != nil {
 		t.Fatal(err)
@@ -559,11 +610,33 @@ func trustedDirectory(t *testing.T) string {
 	if err := os.Chmod(base, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	return makeTrustedDirectory(t, base, 0o700)
+}
+
+func rootExecutableDirectory(t *testing.T) string {
+	t.Helper()
+	for _, base := range []string{"/opt", "/usr/local", "/"} {
+		directory, err := os.MkdirTemp(base, ".tuibox-core-test-*")
+		if err == nil {
+			return makeTrustedDirectoryFromExisting(t, directory, 0o755)
+		}
+	}
+	t.Skip("no writable trusted directory for root credential-drop test")
+	return ""
+}
+
+func makeTrustedDirectory(t *testing.T, base string, mode os.FileMode) string {
+	t.Helper()
 	directory, err := os.MkdirTemp(base, "trusted-core-*")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(directory, 0o700); err != nil {
+	return makeTrustedDirectoryFromExisting(t, directory, mode)
+}
+
+func makeTrustedDirectoryFromExisting(t *testing.T, directory string, mode os.FileMode) string {
+	t.Helper()
+	if err := os.Chmod(directory, mode); err != nil {
 		os.RemoveAll(directory)
 		t.Fatal(err)
 	}
@@ -622,6 +695,12 @@ func waitForOutput(t *testing.T, process Process, text string) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("process output did not contain %q: %q", text, process.Output())
+}
+
+func expectedConfigOutput(t *testing.T, request ConnectionRequest, uid, gid int) string {
+	t.Helper()
+	digest := sha256.Sum256(generateConfig(t, request))
+	return fmt.Sprintf("uid=%d gid=%d config-sha256=%x config-stdin", uid, gid, digest)
 }
 
 func buildCoreHelper(t *testing.T) string {

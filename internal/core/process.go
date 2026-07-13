@@ -1,6 +1,7 @@
 package core
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -21,7 +22,7 @@ const (
 	commandCheck = "check"
 	commandRun   = "run"
 
-	inheritedConfigPath = "/dev/fd/3"
+	standardInputConfigPath = "/dev/stdin"
 
 	maxGeneratedConfigBytes = 128 * 1024
 	maxCoreOutputBytes      = 64 * 1024
@@ -300,14 +301,13 @@ func (runner *execRunner) Check(ctx context.Context, prepared *PreparedConfig) e
 	if err := runner.inspectExecutable(); err != nil {
 		return err
 	}
-	file, digest, err := runner.openVerifiedConfig(state)
+	config, digest, err := runner.readVerifiedConfig(state)
 	if err != nil {
 		return err
 	}
-	defer file.Close()
 
 	output := newBoundedBuffer(maxCoreOutputBytes)
-	command := runner.command(ctx, commandCheck, file, state.request)
+	command := runner.command(ctx, commandCheck, config, state.request)
 	command.Stdout = output
 	command.Stderr = output
 	if err := command.Run(); err != nil {
@@ -344,29 +344,22 @@ func (runner *execRunner) Start(ctx context.Context, prepared *PreparedConfig) (
 	if err := runner.inspectExecutable(); err != nil {
 		return nil, err
 	}
-	file, digest, err := runner.openVerifiedConfig(state)
+	config, digest, err := runner.readVerifiedConfig(state)
 	if err != nil {
 		return nil, err
 	}
 	if digest != state.checkedDigest {
-		_ = file.Close()
 		return nil, ErrPreparedConfigChanged
 	}
 
 	output := newBoundedBuffer(maxCoreOutputBytes)
-	command := runner.command(ctx, commandRun, file, state.request)
+	command := runner.command(ctx, commandRun, config, state.request)
 	command.Stdout = output
 	command.Stderr = output
 	if err := command.Start(); err != nil {
-		_ = file.Close()
 		if contextErr := ctx.Err(); contextErr != nil {
 			return nil, contextErr
 		}
-		return nil, ErrCoreStartFailed
-	}
-	if err := file.Close(); err != nil {
-		_ = signalProcessGroup(command.Process.Pid, syscall.SIGKILL)
-		_ = command.Wait()
 		return nil, ErrCoreStartFailed
 	}
 	return newManagedProcess(command, output), nil
@@ -389,32 +382,24 @@ func (runner *execRunner) preparedState(prepared *PreparedConfig) (*preparedStat
 	return state, nil
 }
 
-func (runner *execRunner) openVerifiedConfig(state *preparedState) (*os.File, [sha256.Size]byte, error) {
+func (runner *execRunner) readVerifiedConfig(state *preparedState) ([]byte, [sha256.Size]byte, error) {
 	file, err := runner.runtimeRoot.Open(state.name)
 	if err != nil {
 		return nil, [sha256.Size]byte{}, ErrPreparedConfigChanged
 	}
+	defer file.Close()
 	if err := validatePreparedFile(file); err != nil {
-		_ = file.Close()
 		return nil, [sha256.Size]byte{}, err
 	}
-	hash := sha256.New()
-	written, err := io.Copy(hash, io.LimitReader(file, maxGeneratedConfigBytes+1))
-	if err != nil || written > maxGeneratedConfigBytes {
-		_ = file.Close()
+	config, err := io.ReadAll(io.LimitReader(file, maxGeneratedConfigBytes+1))
+	if err != nil || len(config) > maxGeneratedConfigBytes {
 		return nil, [sha256.Size]byte{}, ErrPreparedConfigChanged
 	}
-	var digest [sha256.Size]byte
-	copy(digest[:], hash.Sum(nil))
+	digest := sha256.Sum256(config)
 	if digest != state.digest {
-		_ = file.Close()
 		return nil, [sha256.Size]byte{}, ErrPreparedConfigChanged
 	}
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		_ = file.Close()
-		return nil, [sha256.Size]byte{}, ErrPreparedConfigChanged
-	}
-	return file, digest, nil
+	return config, digest, nil
 }
 
 func (runner *execRunner) inspectRuntimeRoot() error {
@@ -433,10 +418,10 @@ func (runner *execRunner) inspectExecutable() error {
 	return nil
 }
 
-func (runner *execRunner) command(ctx context.Context, operation string, config *os.File, request ConnectionRequest) *exec.Cmd {
-	command := exec.CommandContext(ctx, runner.executable, operation, "-c", inheritedConfigPath)
+func (runner *execRunner) command(ctx context.Context, operation string, config []byte, request ConnectionRequest) *exec.Cmd {
+	command := exec.CommandContext(ctx, runner.executable, operation, "-c", standardInputConfigPath)
 	command.Env = []string{}
-	command.ExtraFiles = []*os.File{config}
+	command.Stdin = bytes.NewReader(config)
 	command.WaitDelay = processWaitDelay
 	configureCommand(command, operation, request)
 	command.Cancel = func() error {
